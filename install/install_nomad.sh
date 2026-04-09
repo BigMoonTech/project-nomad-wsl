@@ -374,10 +374,18 @@ setup_nvidia_wsl2() {
   # Docker Desktop handles the NVIDIA runtime — no toolkit installation or daemon.json needed.
   # The only requirement is the correct NVIDIA Windows driver (525.60.13+).
 
+  # Find nvidia-smi — sudo can strip PATH, so check common WSL2 locations explicitly
+  local nvidia_smi=""
+  if command -v nvidia-smi &> /dev/null; then
+    nvidia_smi="nvidia-smi"
+  elif [[ -x /usr/lib/wsl/lib/nvidia-smi ]]; then
+    nvidia_smi="/usr/lib/wsl/lib/nvidia-smi"
+  fi
+
   # Check if nvidia-smi is available (provided by the NVIDIA Windows driver into WSL2)
-  if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+  if [[ -n "$nvidia_smi" ]] && $nvidia_smi &> /dev/null; then
     echo -e "${GREEN}#${RESET} NVIDIA GPU detected via WSL2 driver passthrough:\\n"
-    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null | while read -r line; do
+    $nvidia_smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null | while read -r line; do
       echo -e "  ${WHITE_R}$line${RESET}"
     done
     echo ""
@@ -491,7 +499,26 @@ download_management_compose_file() {
   sed -i "s|DB_PASSWORD=replaceme|DB_PASSWORD=${db_user_password}|g" "$compose_file_path"
   sed -i "s|MYSQL_ROOT_PASSWORD=replaceme|MYSQL_ROOT_PASSWORD=${db_root_password}|g" "$compose_file_path"
   sed -i "s|MYSQL_PASSWORD=replaceme|MYSQL_PASSWORD=${db_user_password}|g" "$compose_file_path"
-  
+
+  # WSL2: The disk-collector sidecar's "/:/host:ro,rslave" mount fails because
+  # WSL2's root filesystem is not a shared mount. Remove the disk-collector
+  # service entirely — the admin app falls back to the systeminformation library.
+  if $IS_WSL; then
+    echo -e "${YELLOW}#${RESET} WSL2 detected: removing disk-collector service (incompatible mount)...\\n"
+    sed -i '/^  disk-collector:/,/^  [a-z]/{ /^  disk-collector:/d; /^  [a-z]/!d; }' "$compose_file_path"
+    # Cleaner approach: remove the entire disk-collector block
+    python3 -c "
+import re, sys
+text = open('$compose_file_path').read()
+text = re.sub(r'  disk-collector:.*?(?=\n  \w|\nvolumes:)', '', text, flags=re.DOTALL)
+open('$compose_file_path', 'w').write(text)
+" 2>/dev/null || {
+      # Fallback: just comment out the problematic volume line
+      sed -i 's|      - /:/host:ro,rslave|      # - /:/host:ro,rslave  # Disabled on WSL2|' "$compose_file_path"
+      echo -e "${YELLOW}#${RESET} Could not fully remove disk-collector, commented out incompatible mount.\\n"
+    }
+  fi
+
   echo -e "${GREEN}#${RESET} Docker compose file configured successfully.\\n"
 }
 
