@@ -17,25 +17,38 @@
 Project N.O.M.A.D. is a self-contained, offline-first knowledge and education server packed with critical tools, knowledge, and AI to keep you informed and empowered—anytime, anywhere.
 
 ## Installation & Quickstart
-Project N.O.M.A.D. can be installed on any Debian-based operating system (we recommend Ubuntu). Installation is completely terminal-based, and all tools and resources are designed to be accessed through the browser, so there's no need for a desktop environment if you'd rather setup N.O.M.A.D. as a "server" and access it through other clients.
+
+This fork supports both native Debian/Ubuntu and **Windows via WSL2 + Docker Desktop**.
 
 *Note: sudo/root privileges are required to run the install script*
 
-### Quick Install (Debian-based OS Only)
+### Quick Install (Debian-based OS)
 ```bash
 sudo apt-get update && \
 sudo apt-get install -y curl && \
-curl -fsSL https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/install_nomad.sh \
+curl -fsSL https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/heads/main/install/install_nomad.sh \
   -o install_nomad.sh && \
 sudo bash install_nomad.sh
 ```
 
-Project N.O.M.A.D. is now installed on your device! Open a browser and navigate to `http://localhost:8080` (or `http://DEVICE_IP:8080`) to start exploring!
+### Windows Install (WSL2 + Docker Desktop)
 
-For a complete step-by-step walkthrough (including Ubuntu installation), see the [Installation Guide](https://www.projectnomad.us/install).
+**Prerequisites:**
+1. Install WSL2 with Ubuntu: `wsl --install -d Ubuntu` (PowerShell as Admin)
+2. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) with "Use WSL 2 based engine" enabled
+3. Enable WSL Integration for Ubuntu in Docker Desktop > Settings > Resources > WSL Integration
+4. For GPU acceleration: Install [NVIDIA Windows driver](https://www.nvidia.com/download/index.aspx) 525.60.13+
+
+Then in your **Ubuntu WSL2 terminal**, run the same install command above. The script detects WSL2 automatically and adapts (skips systemctl, skips nvidia-container-toolkit, verifies Docker Desktop instead).
+
+For the full Windows walkthrough, see [install/windows/README.md](install/windows/README.md).
+
+---
+
+Open a browser and navigate to `http://localhost:8080` (or `http://DEVICE_IP:8080`) to start exploring!
 
 ### Advanced Installation
-For more control over the installation process, copy and paste the [Docker Compose template](https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/management_compose.yaml) into a `docker-compose.yml` file and customize it to your liking (be sure to replace any placeholders with your actual values). Then, run `docker compose up -d` to start the Command Center and its dependencies. Note: this method is recommended for advanced users only, as it requires familiarity with Docker and manual configuration before starting.
+For more control over the installation process, copy and paste the [Docker Compose template](https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/heads/main/install/management_compose.yaml) into a `docker-compose.yml` file and customize it to your liking (be sure to replace any placeholders with your actual values). Then, run `docker compose up -d` to start the Command Center and its dependencies. Note: this method is recommended for advanced users only, as it requires familiarity with Docker and manual configuration before starting.
 
 ## How It Works
 N.O.M.A.D. is a management UI ("Command Center") and API that orchestrates a collection of containerized tools and resources via [Docker](https://www.docker.com/). It handles installation, configuration, and updates for everything — so you don't have to.
@@ -153,5 +166,5 @@ sudo bash /opt/project-nomad/update_nomad.sh
 
 ###### Uninstall Script - Need to start fresh? Use the uninstall script to make your life easy. Note: this cannot be undone!
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/uninstall_nomad.sh -o uninstall_nomad.sh && sudo bash uninstall_nomad.sh
+curl -fsSL https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/heads/main/install/uninstall_nomad.sh -o uninstall_nomad.sh && sudo bash uninstall_nomad.sh
 ```
