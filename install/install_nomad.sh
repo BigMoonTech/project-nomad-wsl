@@ -505,18 +505,8 @@ download_management_compose_file() {
   # service entirely — the admin app falls back to the systeminformation library.
   if $IS_WSL; then
     echo -e "${YELLOW}#${RESET} WSL2 detected: removing disk-collector service (incompatible mount)...\\n"
-    sed -i '/^  disk-collector:/,/^  [a-z]/{ /^  disk-collector:/d; /^  [a-z]/!d; }' "$compose_file_path"
-    # Cleaner approach: remove the entire disk-collector block
-    python3 -c "
-import re, sys
-text = open('$compose_file_path').read()
-text = re.sub(r'  disk-collector:.*?(?=\n  \w|\nvolumes:)', '', text, flags=re.DOTALL)
-open('$compose_file_path', 'w').write(text)
-" 2>/dev/null || {
-      # Fallback: just comment out the problematic volume line
-      sed -i 's|      - /:/host:ro,rslave|      # - /:/host:ro,rslave  # Disabled on WSL2|' "$compose_file_path"
-      echo -e "${YELLOW}#${RESET} Could not fully remove disk-collector, commented out incompatible mount.\\n"
-    }
+    # Delete from "  disk-collector:" line through the next blank line (end of that service block)
+    sed -i '/^  disk-collector:/,/^$/d' "$compose_file_path"
   fi
 
   echo -e "${GREEN}#${RESET} Docker compose file configured successfully.\\n"
