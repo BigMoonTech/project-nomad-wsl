@@ -558,50 +558,65 @@ get_local_ip() {
 verify_gpu_setup() {
   # This function only displays GPU setup status and is completely non-blocking
   # It never exits or returns error codes - purely informational
-  
+
   echo -e "\\n${YELLOW}#${RESET} GPU Setup Verification\\n"
   echo -e "${YELLOW}===========================================${RESET}\\n"
-  
-  # Check if NVIDIA GPU is present
+
+  # Find nvidia-smi (sudo strips PATH; on WSL2 it lives in /usr/lib/wsl/lib/)
+  local nvidia_smi=""
   if command -v nvidia-smi &> /dev/null; then
+    nvidia_smi="nvidia-smi"
+  elif [[ -x /usr/lib/wsl/lib/nvidia-smi ]]; then
+    nvidia_smi="/usr/lib/wsl/lib/nvidia-smi"
+  fi
+
+  # Check if NVIDIA GPU is present
+  if [[ -n "$nvidia_smi" ]] && $nvidia_smi &> /dev/null; then
     echo -e "${GREEN}✓${RESET} NVIDIA GPU detected:"
-    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | while read -r line; do
+    $nvidia_smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | while read -r line; do
       echo -e "  ${WHITE_R}$line${RESET}"
     done
     echo ""
   else
     echo -e "${YELLOW}○${RESET} No NVIDIA GPU detected (nvidia-smi not available)\\n"
   fi
-  
-  # Check if NVIDIA Container Toolkit is installed
-  if command -v nvidia-ctk &> /dev/null; then
+
+  # Check if NVIDIA Container Toolkit is installed (not applicable on WSL2)
+  if $IS_WSL; then
+    echo -e "${GREEN}✓${RESET} WSL2 — GPU runtime managed by Docker Desktop (no toolkit needed)\\n"
+  elif command -v nvidia-ctk &> /dev/null; then
     echo -e "${GREEN}✓${RESET} NVIDIA Container Toolkit installed: $(nvidia-ctk --version 2>/dev/null | head -n1)\\n"
   else
     echo -e "${YELLOW}○${RESET} NVIDIA Container Toolkit not installed\\n"
   fi
-  
+
   # Check if Docker has NVIDIA runtime
   if docker info 2>/dev/null | grep -q "nvidia"; then
     echo -e "${GREEN}✓${RESET} Docker NVIDIA runtime configured\\n"
   else
     echo -e "${YELLOW}○${RESET} Docker NVIDIA runtime not detected\\n"
   fi
-  
+
   # Check for AMD GPU
   if command -v lspci &> /dev/null; then
     if lspci 2>/dev/null | grep -iE "amd|radeon" &> /dev/null; then
       echo -e "${YELLOW}○${RESET} AMD GPU detected (ROCm support not currently available)\\n"
     fi
   fi
-  
+
   echo -e "${YELLOW}===========================================${RESET}\\n"
-  
-  # Summary
-  if command -v nvidia-smi &> /dev/null && docker info 2>/dev/null | grep -q "nvidia"; then
+
+  # Summary — on WSL2 trust docker info over nvidia-smi availability
+  local gpu_detected=false
+  if [[ -n "$nvidia_smi" ]] && $nvidia_smi &> /dev/null; then
+    gpu_detected=true
+  fi
+
+  if ($gpu_detected || $IS_WSL) && docker info 2>/dev/null | grep -q "nvidia"; then
     echo -e "${GREEN}#${RESET} GPU acceleration is properly configured! The AI Assistant will use your GPU.\\n"
   else
     echo -e "${YELLOW}#${RESET} GPU acceleration not detected. The AI Assistant will run in CPU-only mode.\\n"
-    if command -v nvidia-smi &> /dev/null && ! docker info 2>/dev/null | grep -q "nvidia"; then
+    if $gpu_detected && ! docker info 2>/dev/null | grep -q "nvidia"; then
       echo -e "${YELLOW}#${RESET} Tip: Your GPU is detected but Docker runtime is not configured.\\n"
       if $IS_WSL; then
         echo -e "${YELLOW}#${RESET} Try restarting Docker Desktop from the Windows system tray.\\n"
