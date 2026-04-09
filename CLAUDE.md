@@ -116,9 +116,13 @@ These are Docker containers managed by the Command Center UI:
 - **Release notes**: Maintained in `admin/docs/release-notes.md` by maintainers, not in PRs.
 - **Module imports**: Use `#` subpath imports (e.g., `#services/docker_service`, `#models/service`). Defined in `admin/package.json` `imports` field.
 
-## Windows/WSL2 Considerations
+## Windows/WSL2 Deployment
 
-- Docker socket path differs: WSL2 uses `/var/run/docker.sock` by default with Docker Desktop integration
-- Storage paths use forward slashes even on Windows (e.g., `C:/nomad-storage`)
-- The install script (`install/install_nomad.sh`) is Debian-only — Windows deployment requires Docker Desktop + WSL2 with a modified setup approach
-- GPU passthrough for Ollama requires NVIDIA Container Toolkit configured in WSL2
+This fork targets Windows via **WSL2 Ubuntu + Docker Desktop**. The install script (`install/install_nomad.sh`) detects WSL2 automatically via `grep -qi microsoft /proc/version` and adjusts its behavior:
+
+- **Docker:** Provided by Docker Desktop, not installed via apt. Script skips `systemctl` checks and uses `docker info` to verify the daemon.
+- **NVIDIA GPU:** Handled entirely by Docker Desktop + the NVIDIA Windows driver (525.60.13+). The script skips `nvidia-container-toolkit` installation and `daemon.json` modification on WSL2 — those are for native Linux only.
+- **Storage:** Uses `/opt/project-nomad/` inside the WSL2 filesystem (same as native Linux).
+- **Docker socket:** `/var/run/docker.sock` is injected into WSL2 by Docker Desktop automatically.
+
+See `install/windows/README.md` for the full Windows installation guide.

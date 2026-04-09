@@ -30,6 +30,10 @@ GREEN='\033[1;32m' # Light Green.
 
 WHIPTAIL_TITLE="Project N.O.M.A.D Installation"
 NOMAD_DIR="/opt/project-nomad"
+IS_WSL=false
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  IS_WSL=true
+fi
 MANAGEMENT_COMPOSE_FILE_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/management_compose.yaml"
 START_SCRIPT_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/start_nomad.sh"
 STOP_SCRIPT_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/stop_nomad.sh"
@@ -143,17 +147,24 @@ generateRandomPass() {
 
 ensure_docker_installed() {
   if ! command -v docker &> /dev/null; then
+    if $IS_WSL; then
+      echo -e "${RED}#${RESET} Docker not found in WSL2. Please ensure Docker Desktop is installed on Windows"
+      echo -e "${RED}#${RESET} and WSL2 integration is enabled for this distro."
+      echo -e "${RED}#${RESET} Docker Desktop > Settings > Resources > WSL Integration > Enable for this distro"
+      exit 1
+    fi
+
     echo -e "${YELLOW}#${RESET} Docker not found. Installing Docker...\\n"
-    
+
     # Update package database
     sudo apt-get update
-    
+
     # Install prerequisites
     sudo apt-get install -y ca-certificates curl
-    
+
     # Create directory for keyrings
     # sudo install -m 0755 -d /etc/apt/keyrings
-    
+
     # # Download Docker's official GPG key
     # sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
     # sudo chmod a+r /etc/apt/keyrings/docker.asc
@@ -181,23 +192,34 @@ ensure_docker_installed() {
       echo -e "${RED}#${RESET} Docker installation failed. Please check the logs and try again."
       exit 1
     fi
-    
+
     echo -e "${GREEN}#${RESET} Docker installation completed.\\n"
   else
     echo -e "${GREEN}#${RESET} Docker is already installed.\\n"
-    
-    # Check if Docker service is running
-    if ! systemctl is-active --quiet docker; then
-      echo -e "${YELLOW}#${RESET} Docker is installed but not running. Attempting to start Docker...\\n"
-      sudo systemctl start docker
-      if ! systemctl is-active --quiet docker; then
-        echo -e "${RED}#${RESET} Failed to start Docker. Please check the Docker service status and try again."
+
+    # Check if Docker is responsive
+    if $IS_WSL; then
+      # On WSL2, Docker is provided by Docker Desktop — no systemd service to check.
+      # Just verify the daemon is reachable.
+      if ! docker info &> /dev/null; then
+        echo -e "${RED}#${RESET} Docker is installed but not responding. Please ensure Docker Desktop is running on Windows."
         exit 1
-      else
-        echo -e "${GREEN}#${RESET} Docker service started successfully.\\n"
       fi
+      echo -e "${GREEN}#${RESET} Docker Desktop (WSL2 integration) is running.\\n"
     else
-      echo -e "${GREEN}#${RESET} Docker service is already running.\\n"
+      # Native Linux — check via systemctl
+      if ! systemctl is-active --quiet docker; then
+        echo -e "${YELLOW}#${RESET} Docker is installed but not running. Attempting to start Docker...\\n"
+        sudo systemctl start docker
+        if ! systemctl is-active --quiet docker; then
+          echo -e "${RED}#${RESET} Failed to start Docker. Please check the Docker service status and try again."
+          exit 1
+        else
+          echo -e "${GREEN}#${RESET} Docker service started successfully.\\n"
+        fi
+      else
+        echo -e "${GREEN}#${RESET} Docker service is already running.\\n"
+      fi
     fi
   fi
 }
@@ -215,9 +237,19 @@ check_docker_compose() {
 setup_nvidia_container_toolkit() {
   # This function attempts to set up NVIDIA GPU support but is non-blocking
   # Any failures will result in warnings but will NOT stop the installation process
-  
+
   echo -e "${YELLOW}#${RESET} Checking for NVIDIA GPU...\\n"
-  
+
+  if $IS_WSL; then
+    # On WSL2 + Docker Desktop, GPU passthrough is handled entirely by Docker Desktop
+    # and the NVIDIA Windows driver. We do NOT install nvidia-container-toolkit or
+    # modify daemon.json — those apply to native Linux Docker only.
+    setup_nvidia_wsl2
+    return $?
+  fi
+
+  # --- Native Linux GPU setup below ---
+
   # Safely detect NVIDIA GPU
   local has_nvidia_gpu=false
   if command -v lspci &> /dev/null; then
@@ -226,7 +258,7 @@ setup_nvidia_container_toolkit() {
       echo -e "${GREEN}#${RESET} NVIDIA GPU detected.\\n"
     fi
   fi
-  
+
   # Also check for nvidia-smi
   if ! $has_nvidia_gpu && command -v nvidia-smi &> /dev/null; then
     if nvidia-smi &> /dev/null; then
@@ -234,59 +266,59 @@ setup_nvidia_container_toolkit() {
       echo -e "${GREEN}#${RESET} NVIDIA GPU detected via nvidia-smi.\\n"
     fi
   fi
-  
+
   if ! $has_nvidia_gpu; then
     echo -e "${YELLOW}#${RESET} No NVIDIA GPU detected. Skipping NVIDIA container toolkit installation.\\n"
     return 0
   fi
-  
+
   # Check if nvidia-container-toolkit is already installed
   if command -v nvidia-ctk &> /dev/null; then
     echo -e "${GREEN}#${RESET} NVIDIA container toolkit is already installed.\\n"
     return 0
   fi
-  
+
   echo -e "${YELLOW}#${RESET} Installing NVIDIA container toolkit...\\n"
-  
+
   # Install dependencies per https://docs.ollama.com/docker - wrapped in error handling
   if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null; then
     echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit GPG key. Continuing anyway...\\n"
     return 0
   fi
-  
+
   if ! curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list 2>/dev/null \
       | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
       | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1; then
     echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit repository. Continuing anyway...\\n"
     return 0
   fi
-  
+
   if ! sudo apt-get update 2>/dev/null; then
     echo -e "${YELLOW}#${RESET} Warning: Failed to update package list. Continuing anyway...\\n"
     return 0
   fi
-  
+
   if ! sudo apt-get install -y nvidia-container-toolkit 2>/dev/null; then
     echo -e "${YELLOW}#${RESET} Warning: Failed to install NVIDIA container toolkit. Continuing anyway...\\n"
     return 0
   fi
-  
+
   echo -e "${GREEN}#${RESET} NVIDIA container toolkit installed successfully.\\n"
-  
+
   # Configure Docker to use NVIDIA runtime
   echo -e "${YELLOW}#${RESET} Configuring Docker to use NVIDIA runtime...\\n"
-  
+
   if ! sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null; then
     echo -e "${YELLOW}#${RESET} nvidia-ctk configure failed, attempting manual configuration...\\n"
-    
+
     # Fallback: Manually configure daemon.json
     local daemon_json="/etc/docker/daemon.json"
     local config_success=false
-    
+
     if [[ -f "$daemon_json" ]]; then
       # Backup existing config (best effort)
       sudo cp "$daemon_json" "${daemon_json}.backup" 2>/dev/null || true
-      
+
       # Check if nvidia runtime already exists
       if ! grep -q '"nvidia"' "$daemon_json" 2>/dev/null; then
         # Add nvidia runtime to existing config using jq if available
@@ -310,31 +342,67 @@ setup_nvidia_container_toolkit() {
         config_success=true
       fi
     fi
-    
+
     if ! $config_success; then
       echo -e "${YELLOW}#${RESET} Manual daemon.json configuration unsuccessful. GPU support may require manual setup.\\n"
     fi
   fi
-  
+
   # Restart Docker service
   echo -e "${YELLOW}#${RESET} Restarting Docker service...\\n"
   if ! sudo systemctl restart docker 2>/dev/null; then
     echo -e "${YELLOW}#${RESET} Warning: Failed to restart Docker service. You may need to restart it manually.\\n"
     return 0
   fi
-  
+
   # Verify NVIDIA runtime is available
   echo -e "${YELLOW}#${RESET} Verifying NVIDIA runtime configuration...\\n"
   sleep 2  # Give Docker a moment to fully restart
-  
+
   if docker info 2>/dev/null | grep -q "nvidia"; then
     echo -e "${GREEN}#${RESET} NVIDIA runtime successfully configured and verified.\\n"
   else
     echo -e "${YELLOW}#${RESET} Warning: NVIDIA runtime not detected in Docker info. GPU acceleration may not work.\\n"
     echo -e "${YELLOW}#${RESET} You may need to manually configure /etc/docker/daemon.json and restart Docker.\\n"
   fi
-  
+
   echo -e "${GREEN}#${RESET} NVIDIA container toolkit configuration completed.\\n"
+}
+
+setup_nvidia_wsl2() {
+  # WSL2 + Docker Desktop GPU setup.
+  # Docker Desktop handles the NVIDIA runtime — no toolkit installation or daemon.json needed.
+  # The only requirement is the correct NVIDIA Windows driver (525.60.13+).
+
+  # Check if nvidia-smi is available (provided by the NVIDIA Windows driver into WSL2)
+  if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    echo -e "${GREEN}#${RESET} NVIDIA GPU detected via WSL2 driver passthrough:\\n"
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null | while read -r line; do
+      echo -e "  ${WHITE_R}$line${RESET}"
+    done
+    echo ""
+  else
+    echo -e "${YELLOW}#${RESET} nvidia-smi not available in WSL2.\\n"
+    echo -e "${YELLOW}#${RESET} To enable GPU acceleration, install the NVIDIA Windows driver (525.60.13 or later)\\n"
+    echo -e "${YELLOW}#${RESET} from https://www.nvidia.com/download/index.aspx\\n"
+    echo -e "${YELLOW}#${RESET} Continuing without GPU support...\\n"
+    return 0
+  fi
+
+  # Verify Docker Desktop exposes the NVIDIA runtime
+  if docker info 2>/dev/null | grep -qi nvidia; then
+    echo -e "${GREEN}#${RESET} Docker Desktop NVIDIA runtime is available. GPU acceleration is ready.\\n"
+  else
+    echo -e "${YELLOW}#${RESET} NVIDIA GPU is present but Docker Desktop does not show the NVIDIA runtime.\\n"
+    echo -e "${YELLOW}#${RESET} Please check the following:\\n"
+    echo -e "${YELLOW}#${RESET}   1. Docker Desktop is up to date\\n"
+    echo -e "${YELLOW}#${RESET}   2. Settings > General > 'Use the WSL 2 based engine' is enabled\\n"
+    echo -e "${YELLOW}#${RESET}   3. NVIDIA Windows driver is version 525.60.13 or later\\n"
+    echo -e "${YELLOW}#${RESET}   4. Try restarting Docker Desktop from the Windows system tray\\n"
+    echo -e "${YELLOW}#${RESET} Continuing without GPU support...\\n"
+  fi
+
+  return 0
 }
 
 get_install_confirmation(){
@@ -518,15 +586,24 @@ verify_gpu_setup() {
     echo -e "${YELLOW}#${RESET} GPU acceleration not detected. The AI Assistant will run in CPU-only mode.\\n"
     if command -v nvidia-smi &> /dev/null && ! docker info 2>/dev/null | grep -q "nvidia"; then
       echo -e "${YELLOW}#${RESET} Tip: Your GPU is detected but Docker runtime is not configured.\\n"
-      echo -e "${YELLOW}#${RESET} Try restarting Docker: ${WHITE_R}sudo systemctl restart docker${RESET}\\n"
+      if $IS_WSL; then
+        echo -e "${YELLOW}#${RESET} Try restarting Docker Desktop from the Windows system tray.\\n"
+      else
+        echo -e "${YELLOW}#${RESET} Try restarting Docker: ${WHITE_R}sudo systemctl restart docker${RESET}\\n"
+      fi
     fi
   fi
 }
 
 success_message() {
   echo -e "${GREEN}#${RESET} Project N.O.M.A.D installation completed successfully!\\n"
-  echo -e "${GREEN}#${RESET} Installation files are located at /opt/project-nomad\\n\n"
-  echo -e "${GREEN}#${RESET} Project N.O.M.A.D's Command Center should automatically start whenever your device reboots. However, if you need to start it manually, you can always do so by running: ${WHITE_R}${NOMAD_DIR}/start_nomad.sh${RESET}\\n"
+  echo -e "${GREEN}#${RESET} Installation files are located at ${NOMAD_DIR}\\n\\n"
+  if $IS_WSL; then
+    echo -e "${GREEN}#${RESET} Containers will run as long as Docker Desktop is running on Windows.\\n"
+    echo -e "${GREEN}#${RESET} To start containers manually: ${WHITE_R}${NOMAD_DIR}/start_nomad.sh${RESET}\\n"
+  else
+    echo -e "${GREEN}#${RESET} Project N.O.M.A.D's Command Center should automatically start whenever your device reboots. However, if you need to start it manually, you can always do so by running: ${WHITE_R}${NOMAD_DIR}/start_nomad.sh${RESET}\\n"
+  fi
   echo -e "${GREEN}#${RESET} You can now access the management interface at http://localhost:8080 or http://${local_ip_address}:8080\\n"
   echo -e "${GREEN}#${RESET} Thank you for supporting Project N.O.M.A.D!\\n"
 }
