@@ -82,7 +82,11 @@ This should display your GPU info from inside a container. If it does, GPU passt
 Open your Ubuntu WSL2 terminal and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/heads/main/install/install_nomad.sh | sudo bash
+sudo apt-get update && \
+sudo apt-get install -y curl && \
+curl -fsSL https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/heads/main/install/install_nomad.sh \
+  -o install_nomad.sh && \
+sudo bash install_nomad.sh
 ```
 
 The script will:
