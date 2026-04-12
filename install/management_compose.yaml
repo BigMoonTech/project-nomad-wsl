@@ -97,7 +97,7 @@ services:
       retries: 3
   updater:
     # Updater is a lightweight sidecar container that allows the admin container to be updated from within it's own UI
-    image: ghcr.io/crosstalk-solutions/project-nomad-sidecar-updater:latest
+    image: ghcr.io/bigmoontech/project-nomad-wsl-sidecar-updater:latest
     pull_policy: always
     container_name: nomad_updater
     restart: unless-stopped
