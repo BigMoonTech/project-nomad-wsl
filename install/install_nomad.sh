@@ -500,13 +500,12 @@ download_management_compose_file() {
   sed -i "s|MYSQL_ROOT_PASSWORD=replaceme|MYSQL_ROOT_PASSWORD=${db_root_password}|g" "$compose_file_path"
   sed -i "s|MYSQL_PASSWORD=replaceme|MYSQL_PASSWORD=${db_user_password}|g" "$compose_file_path"
 
-  # WSL2: The disk-collector sidecar's "/:/host:ro,rslave" mount fails because
-  # WSL2's root filesystem is not a shared mount. Remove the disk-collector
-  # service entirely — the admin app falls back to the systeminformation library.
+  # WSL2: The disk-collector sidecar's "rslave" mount propagation flag fails because
+  # WSL2's root filesystem is not a shared mount. Replace with plain read-only mount.
+  # Only trade-off: hot-plugged drives won't auto-appear (irrelevant for WSL2 desktops).
   if $IS_WSL; then
-    echo -e "${YELLOW}#${RESET} WSL2 detected: removing disk-collector service (incompatible mount)...\\n"
-    # Delete from "  disk-collector:" line through the next blank line (end of that service block)
-    sed -i '/^  disk-collector:/,/^$/d' "$compose_file_path"
+    echo -e "${YELLOW}#${RESET} WSL2 detected: adjusting disk-collector mount for compatibility...\\n"
+    sed -i 's|/:/host:ro,rslave|/:/host:ro|' "$compose_file_path"
   fi
 
   echo -e "${GREEN}#${RESET} Docker compose file configured successfully.\\n"

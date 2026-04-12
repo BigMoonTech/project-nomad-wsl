@@ -108,7 +108,7 @@ services:
   disk-collector:
     # Disk Collector is a lightweight privileged container that collects disk usage information from the host system and shares it with the admin container so it can be displayed in the UI. 
     # It requires read-only access to the host filesystem and is designed to be as secure and limited in scope as possible while still providing the necessary functionality.
-    image: ghcr.io/crosstalk-solutions/project-nomad-disk-collector:latest
+    image: ghcr.io/bigmoontech/project-nomad-wsl-disk-collector:latest
     pull_policy: always
     container_name: nomad_disk_collector
     restart: unless-stopped
