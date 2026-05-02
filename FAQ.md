@@ -99,7 +99,14 @@ Because NOMAD is still a young project, some PRs (particularly those for new fea
 
 ## I have a question that isn't answered here. Where can I ask for help?
 
-If you have a question that isn't answered in this FAQ, please feel free to ask for help in our Discord community (https://discord.com/invite/crosstalksolutions) or on our Github Discussions page (https://github.com/Crosstalk-Solutions/project-nomad/discussions).
+**For general N.O.M.A.D. questions** (how a feature works, content, hardware recommendations, etc.), the upstream Project N.O.M.A.D. community is the best place:
+- Discord: https://discord.com/invite/crosstalksolutions
+- GitHub Discussions: https://github.com/Crosstalk-Solutions/project-nomad/discussions
+
+**For Windows / WSL2 / Docker Desktop-specific questions** (install issues unique to WSL2, GPU passthrough on Windows, fork-specific bugs, etc.), use this fork's issue tracker:
+- https://github.com/BigMoonTech/project-nomad-wsl/issues
+
+This fork (BigMoonTech) only adds Windows/WSL2 support — for anything else, the upstream community can help you faster.
 
 ## I have a suggestion for a new feature or improvement. How can I share it?
 

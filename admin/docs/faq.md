@@ -286,7 +286,10 @@ Try asking a question in [AI Chat](/chat). The local AI can answer questions abo
 You're in the docs now. Use the menu to find specific topics.
 
 ### Join the community
-Get help from other NOMAD users on **[Discord](https://discord.com/invite/crosstalksolutions)**.
+Get help from other NOMAD users on **[Discord](https://discord.com/invite/crosstalksolutions)** for general N.O.M.A.D. questions.
+
+### Windows / WSL2-specific issues
+This is the **unofficial WSL2 fork** by BigMoonTech. For Windows / WSL2 / Docker Desktop-specific bugs, use the [fork's GitHub issues](https://github.com/BigMoonTech/project-nomad-wsl/issues). For everything else, the upstream Discord above is the right place.
 
 ### Release Notes
 See what's changed in each version: **[Release Notes](/docs/release-notes)**
