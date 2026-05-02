@@ -5,6 +5,7 @@ import logger from '@adonisjs/core/services/logger'
 import { ExtractZIMChunkingStrategy, ExtractZIMContentOptions, ZIMContentChunk, ZIMArchiveMetadata } from '../../types/zim.js'
 import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
+import { isValidZimFile } from '../utils/fs.js'
 
 export class ZIMExtractionService {
 
@@ -51,7 +52,13 @@ export class ZIMExtractionService {
                 logger.error(`[ZIMExtractionService]: ZIM file not accessible: ${filePath}`)
                 throw new Error(`ZIM file not found or not accessible: ${filePath}`)
             }
-            
+
+            // Validate ZIM magic number before opening with native library.
+            // A corrupted file causes a native C++ abort that cannot be caught by JS.
+            if (!(await isValidZimFile(filePath))) {
+                throw new Error(`ZIM file is invalid or corrupted: ${filePath}`)
+            }
+
             const archive = new Archive(filePath)
 
             // Extract archive-level metadata once
@@ -209,7 +216,10 @@ export class ZIMExtractionService {
         const sections: Array<{ heading: string; text: string; level: number }> = [];
         let currentSection = { heading: 'Introduction', content: [] as string[], level: 2 };
 
-        $('body').children().each((_, element) => {
+        // Walk the full DOM rather than only direct children of <body>. Modern ZIMs (Devdocs,
+        // Wikipedia, FreeCodeCamp, etc.) wrap article content in a container div, which under
+        // .children() would be a single non-heading/non-paragraph element and yield zero sections.
+        $('body').find('h2, h3, h4, p, ul, ol, dl, table').each((_, element) => {
             const $el = $(element);
             const tagName = element.tagName?.toLowerCase();
 
@@ -244,6 +254,20 @@ export class ZIMExtractionService {
                 text: currentSection.content.join(' ').replace(/\s+/g, ' ').trim(),
                 level: currentSection.level,
             });
+        }
+
+        // Fallback: if the selector walk produced no sections but the body has meaningful
+        // text (unusual structure, minimal markup), emit one section with the full body text
+        // so the article still contributes to the knowledge base.
+        if (sections.length === 0) {
+            const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
+            if (bodyText.length > 0) {
+                sections.push({
+                    heading: title || 'Content',
+                    text: bodyText,
+                    level: 2,
+                });
+            }
         }
 
         return {
