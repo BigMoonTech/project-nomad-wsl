@@ -29,14 +29,16 @@ ARG BUILD_DATE
 ARG VCS_REF
 
 # Labels
-LABEL org.opencontainers.image.title="Project N.O.M.A.D" \
-      org.opencontainers.image.description="The Project N.O.M.A.D Official Docker image" \
+LABEL org.opencontainers.image.title="Project N.O.M.A.D (WSL2 fork)" \
+      org.opencontainers.image.description="Project N.O.M.A.D Docker image with Windows/WSL2 + Docker Desktop support. Fork of Crosstalk Solutions' Project N.O.M.A.D." \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.vendor="Crosstalk Solutions, LLC" \
-      org.opencontainers.image.documentation="https://github.com/CrosstalkSolutions/project-nomad/blob/main/README.md" \
-      org.opencontainers.image.source="https://github.com/CrosstalkSolutions/project-nomad" \
+      org.opencontainers.image.vendor="BigMoonTech" \
+      org.opencontainers.image.authors="BigMoonTech" \
+      org.opencontainers.image.documentation="https://github.com/BigMoonTech/project-nomad-wsl/blob/main/README.md" \
+      org.opencontainers.image.source="https://github.com/BigMoonTech/project-nomad-wsl" \
+      org.opencontainers.image.url="https://github.com/BigMoonTech/project-nomad-wsl" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 ENV NODE_ENV=production
