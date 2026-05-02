@@ -73,7 +73,7 @@ export default function SupportPage() {
                   rel="noopener noreferrer"
                   className="text-blue-600 hover:underline"
                 >
-                  Star the project on GitHub
+                  Star the upstream project on GitHub
                 </a>
                 {' '}— it helps more people discover NOMAD
               </li>
@@ -84,7 +84,7 @@ export default function SupportPage() {
                   rel="noopener noreferrer"
                   className="text-blue-600 hover:underline"
                 >
-                  Report bugs and suggest features
+                  Report general bugs and suggest features
                 </a>
                 {' '}— every report makes NOMAD better
               </li>
@@ -99,6 +99,55 @@ export default function SupportPage() {
                   Join the Discord community
                 </a>
                 {' '}— hang out, share your build, help other users
+              </li>
+            </ul>
+          </section>
+
+          {/* WSL2 Fork */}
+          <section className="mb-10 p-5 rounded-lg border border-desert-stone-light bg-desert-stone-lighter/30">
+            <h2 className="text-2xl font-semibold mb-3">About This Build</h2>
+            <p className="text-text-muted mb-4">
+              You're running the unofficial <strong>WSL2 + Docker Desktop</strong> fork of Project N.O.M.A.D.,
+              maintained by{' '}
+              <a
+                href="https://github.com/BigMoonTech"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:underline"
+              >
+                BigMoonTech
+              </a>. The original project by{' '}
+              <a
+                href="https://crosstalksolutions.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:underline"
+              >
+                Crosstalk Solutions
+              </a>
+              {' '}targets Debian/Ubuntu only — this fork adds Windows support.
+            </p>
+            <ul className="space-y-2 text-text-muted">
+              <li>
+                <a
+                  href="https://github.com/BigMoonTech/project-nomad-wsl/issues"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 hover:underline"
+                >
+                  Report Windows/WSL2-specific bugs
+                </a>
+                {' '}— for issues unique to running on WSL2 + Docker Desktop
+              </li>
+              <li>
+                <a
+                  href="https://github.com/BigMoonTech/project-nomad-wsl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 hover:underline"
+                >
+                  View the fork on GitHub
+                </a>
               </li>
             </ul>
           </section>

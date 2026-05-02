@@ -1,16 +1,27 @@
 <div align="center">
 <img src="admin/public/project_nomad_logo.webp" width="200" height="200"/>
 
-# Project N.O.M.A.D.
+# Project N.O.M.A.D. — WSL2 Edition
+
 ### Node for Offline Media, Archives, and Data
 
-**Knowledge That Never Goes Offline**
+**Knowledge That Never Goes Offline — now on Windows**
 
 [![Website](https://img.shields.io/badge/Website-projectnomad.us-blue)](https://www.projectnomad.us)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2)](https://discord.com/invite/crosstalksolutions)
 [![Benchmark](https://img.shields.io/badge/Benchmark-Leaderboard-green)](https://benchmark.projectnomad.us)
 
 </div>
+
+---
+
+> ## ⚠️ Unofficial Fork
+>
+> **This is an unofficial fork of [Project N.O.M.A.D.](https://github.com/Crosstalk-Solutions/project-nomad) by [Crosstalk Solutions](https://crosstalksolutions.com), maintained by [BigMoonTech](https://github.com/BigMoonTech) to add first-class **Windows + WSL2 + Docker Desktop** support.
+>
+> The original project targets Debian/Ubuntu Linux only. This fork detects WSL2 automatically and adapts the install/update flow accordingly — including correct NVIDIA GPU passthrough via Docker Desktop and the Windows NVIDIA driver. Native Linux installs continue to work unchanged.
+>
+> **For official support, the upstream project, and the wider N.O.M.A.D. community, see the [original repository](https://github.com/Crosstalk-Solutions/project-nomad). For Windows/WSL2-specific issues, use [this fork's issue tracker](https://github.com/BigMoonTech/project-nomad-wsl/issues).**
 
 ---
 

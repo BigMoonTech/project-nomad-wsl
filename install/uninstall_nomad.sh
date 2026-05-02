@@ -4,10 +4,11 @@
 
 ###################################################################################################################################################################################################
 
-# Script                | Project N.O.M.A.D. Uninstall Script
+# Script                | Project N.O.M.A.D. Uninstall Script (WSL2 fork)
 # Version               | 1.0.0
-# Author                | Crosstalk Solutions, LLC
-# Website               | https://crosstalksolutions.com
+# Fork                  | BigMoonTech — adds Windows/WSL2 + Docker Desktop support
+# Original Author       | Crosstalk Solutions, LLC (https://crosstalksolutions.com)
+# Fork Repo             | https://github.com/BigMoonTech/project-nomad-wsl
 
 ###################################################################################################################################################################################################
 #                                                                                                                                                                                                 #

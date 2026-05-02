@@ -1,17 +1,23 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
-  - name: 💬 Discord Community
+  - name: ⚠️ Is this a Windows/WSL2-specific issue?
+    url: https://github.com/BigMoonTech/project-nomad-wsl/issues/new
+    about: Yes — this fork only handles Windows/WSL2 + Docker Desktop bugs. Open an issue here.
+  - name: 🐧 Is this a general N.O.M.A.D. issue (not Windows-specific)?
+    url: https://github.com/Crosstalk-Solutions/project-nomad/issues/new
+    about: Report it on the official upstream project — they handle the core app
+  - name: 💬 Discord Community (upstream)
     url: https://discord.com/invite/crosstalksolutions
-    about: Join our Discord community for general questions, support, and discussions
-  - name: 📖 Documentation
+    about: Join the official N.O.M.A.D. Discord for general questions and discussion
+  - name: 📖 Official Documentation
     url: https://projectnomad.us
     about: Check the official documentation and guides
   - name: 🏆 Community Leaderboard
     url: https://benchmark.projectnomad.us
     about: View the N.O.M.A.D. benchmark leaderboard
-  - name: 🤝 Contributing Guide
+  - name: 🤝 Upstream Contributing Guide
     url: https://github.com/Crosstalk-Solutions/project-nomad/blob/main/CONTRIBUTING.md
-    about: Learn how to contribute to Project N.O.M.A.D.
-  - name: 📅 Roadmap
+    about: Learn how to contribute to the upstream Project N.O.M.A.D.
+  - name: 📅 Roadmap (upstream)
     url: https://roadmap.projectnomad.us
-    about: See our public roadmap, vote on features, and suggest new ones
+    about: See the public roadmap, vote on features, and suggest new ones
