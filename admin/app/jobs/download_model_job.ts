@@ -165,12 +165,39 @@ export class DownloadModelJob {
     const queue = queueService.getQueue(this.queue)
     const jobId = this.getJobId(params.modelName)
 
-    // Clear any previous failed job so a fresh attempt can be dispatched
+    // Clear any previous failed job so a fresh attempt can be dispatched.
+    // Also clear "completed" jobs that are false positives — see comment below.
     const existing = await queue.getJob(jobId)
     if (existing) {
       const state = await existing.getState()
       if (state === 'failed') {
         await existing.remove()
+      } else if (state === 'completed') {
+        // Verify the model is actually installed in Ollama. If yes, the job
+        // genuinely succeeded — leave it (preserves the "already installed,
+        // skip re-pull" optimization). If no, the prior "completion" was a
+        // false positive (pre-v1.32.1 silent-success bug where Ollama stream
+        // errors were swallowed and downloadModel() returned success: true).
+        // Remove the stale record so the new dispatch can retry properly.
+        try {
+          const ollamaService = new OllamaService()
+          const installed = await ollamaService.getModels()
+          const isInstalled = installed?.some((m) => m.name === params.modelName) ?? false
+          if (!isInstalled) {
+            logger.info(
+              `[DownloadModelJob] Removing stale completed job for "${params.modelName}" — model is not actually installed (likely a pre-v1.32.1 silent-success record)`
+            )
+            await existing.remove()
+          }
+        } catch (err) {
+          // Can't verify (e.g. Ollama not yet running) — remove the cached
+          // completion to be safe. The new dispatch will retry; if Ollama
+          // really isn't ready, BullMQ's backoff will hold the job until it is.
+          logger.warn(
+            `[DownloadModelJob] Could not verify install state of "${params.modelName}", removing cached completed job: ${err instanceof Error ? err.message : err}`
+          )
+          await existing.remove()
+        }
       }
     }
 
