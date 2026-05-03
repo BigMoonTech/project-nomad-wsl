@@ -142,7 +142,19 @@ const ActiveModelDownloads = ({ withHeader = false }: ActiveModelDownloadsProps)
                                             <p className="text-xs text-red-600 mt-0.5">{download.error}</p>
                                         </div>
                                         <button
-                                            onClick={() => removeDownload(download.model)}
+                                            onClick={async () => {
+                                                // Remove the BullMQ failed job too — clearing only local state
+                                                // leaves the server-polled Active Downloads view stale.
+                                                if (download.jobId) {
+                                                    try {
+                                                        await api.removeDownloadJob(download.jobId)
+                                                    } catch (err) {
+                                                        // eslint-disable-next-line no-console
+                                                        console.error('Failed to remove job:', err)
+                                                    }
+                                                }
+                                                removeDownload(download.model)
+                                            }}
                                             className="flex-shrink-0 p-1 rounded hover:bg-red-100 transition-colors"
                                             title="Dismiss error"
                                         >

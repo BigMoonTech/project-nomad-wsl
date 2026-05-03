@@ -211,11 +211,8 @@ export class OllamaService {
               continue
             }
 
-            // Detect stream-level errors. Ollama returns HTTP 200 then streams a JSON
-            // message with an `error` field when a pull fails (e.g. model not found,
-            // platform restriction like "requires macOS" on nvfp4/mxfp8/mlx-* tags,
-            // manifest 412). Without this check the stream parser drops the message
-            // and the function falsely reports success.
+            // Ollama can stream {"error":"..."} on HTTP 200 (model not found,
+            // platform restriction, manifest 412). Reject so the catch path runs.
             if (parsed.error) {
               if (signal) signal.removeEventListener('abort', onAbort)
               return reject(new Error(parsed.error))
@@ -291,9 +288,7 @@ export class OllamaService {
         `[OllamaService] Failed to download model "${model}": ${errorMessage}`
       )
 
-      // Map technical errors to friendly user messages and decide retryability.
-      // Non-retryable errors flag the BullMQ job as UnrecoverableError, preventing
-      // the 40-attempt retry storm that would otherwise occur for permanent failures.
+      // Permanent failures return retryable: false so BullMQ doesn't retry 40x.
       const isVersionMismatch = errorMessage.includes('newer version of Ollama')
       const isPlatformRestricted =
         errorMessage.includes('requires macOS') ||
@@ -314,10 +309,8 @@ export class OllamaService {
         userMessage = `Failed to download model "${model}": ${errorMessage}`
       }
 
-      // Permanent failures (version, platform, missing manifest) should not be retried
       const isRetryable = !isVersionMismatch && !isPlatformRestricted && !isManifestMissing
 
-      // Broadcast failure to connected clients so UI can show the error
       this.broadcastDownloadError(model, userMessage)
 
       return { success: false, message: userMessage, retryable: isRetryable }

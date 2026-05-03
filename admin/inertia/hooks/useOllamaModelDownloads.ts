@@ -46,10 +46,8 @@ export default function useOllamaModelDownloads() {
                 const updated = new Map(prev)
 
                 if (data.percent === -1) {
-                    // Download failed — show error state and persist until the user dismisses it.
-                    // Previously auto-removed after 15s, but that hid the failure reason from users
-                    // who weren't watching the Active Downloads section the moment the click happened.
-                    // Users can dismiss via the X button in the failed-state UI.
+                    // Persist until user dismisses — auto-removal was hiding failures
+                    // from users not watching the panel at the moment of click.
                     updated.set(data.model, data)
                 } else if (data.percent === -2) {
                     // Download cancelled — clear quickly (matches the completion TTL).
