@@ -203,48 +203,61 @@ export class OllamaService {
           buffer = lines.pop() || ''
           for (const line of lines) {
             if (!line.trim()) continue
+            let parsed: any
             try {
-              const parsed = JSON.parse(line)
-              if (parsed.completed && parsed.total && parsed.digest) {
-                // Update this digest's progress — take the max seen value so transient
-                // out-of-order updates don't make the aggregate jump backwards.
-                const existing = digestProgress.get(parsed.digest)
-                digestProgress.set(parsed.digest, {
-                  completed: Math.max(existing?.completed ?? 0, parsed.completed),
-                  total: Math.max(existing?.total ?? 0, parsed.total),
-                })
-
-                // Compute aggregate across all known blobs
-                let aggCompleted = 0
-                let aggTotal = 0
-                for (const { completed, total } of digestProgress.values()) {
-                  aggCompleted += completed
-                  aggTotal += total
-                }
-
-                const percent = aggTotal > 0
-                  ? parseFloat(((aggCompleted / aggTotal) * 100).toFixed(2))
-                  : 0
-
-                // Throttle broadcasts. Always call the progressCallback though — the worker
-                // uses it to update job state in Redis, which should reflect the latest view.
-                const now = Date.now()
-                if (now - lastBroadcastAt >= BROADCAST_THROTTLE_MS) {
-                  lastBroadcastAt = now
-                  this.broadcastDownloadProgress(model, percent, jobId, {
-                    downloadedBytes: aggCompleted,
-                    totalBytes: aggTotal,
-                  })
-                }
-                if (progressCallback) {
-                  progressCallback(percent, {
-                    downloadedBytes: aggCompleted,
-                    totalBytes: aggTotal,
-                  })
-                }
-              }
+              parsed = JSON.parse(line)
             } catch {
-              // ignore parse errors on partial lines
+              // partial / non-JSON line — wait for more data
+              continue
+            }
+
+            // Detect stream-level errors. Ollama returns HTTP 200 then streams a JSON
+            // message with an `error` field when a pull fails (e.g. model not found,
+            // platform restriction like "requires macOS" on nvfp4/mxfp8/mlx-* tags,
+            // manifest 412). Without this check the stream parser drops the message
+            // and the function falsely reports success.
+            if (parsed.error) {
+              if (signal) signal.removeEventListener('abort', onAbort)
+              return reject(new Error(parsed.error))
+            }
+
+            if (parsed.completed && parsed.total && parsed.digest) {
+              // Update this digest's progress — take the max seen value so transient
+              // out-of-order updates don't make the aggregate jump backwards.
+              const existing = digestProgress.get(parsed.digest)
+              digestProgress.set(parsed.digest, {
+                completed: Math.max(existing?.completed ?? 0, parsed.completed),
+                total: Math.max(existing?.total ?? 0, parsed.total),
+              })
+
+              // Compute aggregate across all known blobs
+              let aggCompleted = 0
+              let aggTotal = 0
+              for (const { completed, total } of digestProgress.values()) {
+                aggCompleted += completed
+                aggTotal += total
+              }
+
+              const percent = aggTotal > 0
+                ? parseFloat(((aggCompleted / aggTotal) * 100).toFixed(2))
+                : 0
+
+              // Throttle broadcasts. Always call the progressCallback though — the worker
+              // uses it to update job state in Redis, which should reflect the latest view.
+              const now = Date.now()
+              if (now - lastBroadcastAt >= BROADCAST_THROTTLE_MS) {
+                lastBroadcastAt = now
+                this.broadcastDownloadProgress(model, percent, jobId, {
+                  downloadedBytes: aggCompleted,
+                  totalBytes: aggTotal,
+                })
+              }
+              if (progressCallback) {
+                progressCallback(percent, {
+                  downloadedBytes: aggCompleted,
+                  totalBytes: aggTotal,
+                })
+              }
             }
           }
         })
@@ -278,16 +291,36 @@ export class OllamaService {
         `[OllamaService] Failed to download model "${model}": ${errorMessage}`
       )
 
-      // Check for version mismatch (Ollama 412 response)
+      // Map technical errors to friendly user messages and decide retryability.
+      // Non-retryable errors flag the BullMQ job as UnrecoverableError, preventing
+      // the 40-attempt retry storm that would otherwise occur for permanent failures.
       const isVersionMismatch = errorMessage.includes('newer version of Ollama')
-      const userMessage = isVersionMismatch
-        ? 'This model requires a newer version of Ollama. Please update AI Assistant from the Apps page.'
-        : `Failed to download model: ${errorMessage}`
+      const isPlatformRestricted =
+        errorMessage.includes('requires macOS') ||
+        errorMessage.includes('requires linux') ||
+        errorMessage.includes('requires windows')
+      const isManifestMissing =
+        /manifest/i.test(errorMessage) &&
+        (/(file does not exist|not found)/i.test(errorMessage) || /\b404\b/.test(errorMessage))
+
+      let userMessage: string
+      if (isVersionMismatch) {
+        userMessage = 'This model requires a newer version of Ollama. Please update AI Assistant from the Apps page.'
+      } else if (isPlatformRestricted) {
+        userMessage = `This model is restricted to a different platform on Ollama's registry. Tags like nvfp4, mxfp8, and mlx-* are often macOS-only. Try a q4_K_M, q5_K_M, q6_K, or q8_0 variant instead.`
+      } else if (isManifestMissing) {
+        userMessage = `Model "${model}" was not found on Ollama's registry. The tag may not exist — try a different quantization (e.g. q4_K_M, q5_K_M, q8_0).`
+      } else {
+        userMessage = `Failed to download model: ${errorMessage}`
+      }
+
+      // Permanent failures (version, platform, missing manifest) should not be retried
+      const isRetryable = !isVersionMismatch && !isPlatformRestricted && !isManifestMissing
 
       // Broadcast failure to connected clients so UI can show the error
       this.broadcastDownloadError(model, userMessage)
 
-      return { success: false, message: userMessage, retryable: !isVersionMismatch }
+      return { success: false, message: userMessage, retryable: isRetryable }
     }
   }
 
