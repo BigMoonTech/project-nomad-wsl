@@ -305,13 +305,13 @@ export class OllamaService {
 
       let userMessage: string
       if (isVersionMismatch) {
-        userMessage = 'This model requires a newer version of Ollama. Please update AI Assistant from the Apps page.'
+        userMessage = `Model "${model}" requires a newer version of Ollama. Please update AI Assistant from the Apps page.`
       } else if (isPlatformRestricted) {
-        userMessage = `This model is restricted to a different platform on Ollama's registry. Tags like nvfp4, mxfp8, and mlx-* are often macOS-only. Try a q4_K_M, q5_K_M, q6_K, or q8_0 variant instead.`
+        userMessage = `Model "${model}" is restricted to a different platform on Ollama's registry. Tags like nvfp4, mxfp8, and mlx-* are often macOS-only. Try a q4_K_M, q5_K_M, q6_K, or q8_0 variant instead.`
       } else if (isManifestMissing) {
         userMessage = `Model "${model}" was not found on Ollama's registry. The tag may not exist — try a different quantization (e.g. q4_K_M, q5_K_M, q8_0).`
       } else {
-        userMessage = `Failed to download model: ${errorMessage}`
+        userMessage = `Failed to download model "${model}": ${errorMessage}`
       }
 
       // Permanent failures (version, platform, missing manifest) should not be retried

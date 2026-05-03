@@ -46,17 +46,11 @@ export default function useOllamaModelDownloads() {
                 const updated = new Map(prev)
 
                 if (data.percent === -1) {
-                    // Download failed — show error state, auto-remove after 15 seconds
+                    // Download failed — show error state and persist until the user dismisses it.
+                    // Previously auto-removed after 15s, but that hid the failure reason from users
+                    // who weren't watching the Active Downloads section the moment the click happened.
+                    // Users can dismiss via the X button in the failed-state UI.
                     updated.set(data.model, data)
-                    const errorTimeout = setTimeout(() => {
-                        timeoutsRef.current.delete(errorTimeout)
-                        setDownloads((current) => {
-                            const next = new Map(current)
-                            next.delete(data.model)
-                            return next
-                        })
-                    }, 15000)
-                    timeoutsRef.current.add(errorTimeout)
                 } else if (data.percent === -2) {
                     // Download cancelled — clear quickly (matches the completion TTL).
                     // Component-level optimistic removal usually beats this branch, but it's

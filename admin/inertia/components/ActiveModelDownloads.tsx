@@ -133,14 +133,21 @@ const ActiveModelDownloads = ({ withHeader = false }: ActiveModelDownloadsProps)
                                 }`}
                             >
                                 {download.error ? (
-                                    <div className="flex items-center gap-2">
-                                        <IconAlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0" />
+                                    <div className="flex items-start gap-2">
+                                        <IconAlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
                                         <div className="flex-1 min-w-0">
                                             <p className="text-sm font-medium text-text-primary truncate">
                                                 {download.model}
                                             </p>
                                             <p className="text-xs text-red-600 mt-0.5">{download.error}</p>
                                         </div>
+                                        <button
+                                            onClick={() => removeDownload(download.model)}
+                                            className="flex-shrink-0 p-1 rounded hover:bg-red-100 transition-colors"
+                                            title="Dismiss error"
+                                        >
+                                            <IconX className="w-4 h-4 text-text-muted hover:text-red-500" />
+                                        </button>
                                     </div>
                                 ) : (
                                     <div className="space-y-2">

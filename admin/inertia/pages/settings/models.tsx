@@ -184,9 +184,12 @@ export default function ModelsPage(props: {
     try {
       const res = await api.downloadModel(modelName)
       if (res.success) {
+        // 'info' (not 'success') because this only confirms the job was queued —
+        // the actual download may still fail (platform restriction, missing manifest,
+        // etc.). The Active Model Downloads section reflects real success/failure.
         addNotification({
-          message: `Model download initiated for ${modelName}. It may take some time to complete.`,
-          type: 'success',
+          message: `Download queued for ${modelName}. See Active Model Downloads for status.`,
+          type: 'info',
         })
       }
     } catch (error) {
