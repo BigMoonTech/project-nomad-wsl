@@ -1,6 +1,6 @@
 # BigMoonTech Project N.O.M.A.D. WSL2 Fork — Maintainer Playbook
 
-This is your operations guide for maintaining the fork: how it's wired together, how to release new versions, how to pull in upstream changes, and how to troubleshoot when things go sideways.
+This is the operations guide for maintaining the fork: how it's wired together, how to release new versions, how to pull in upstream changes, and how to troubleshoot when things go sideways.
 
 ---
 
@@ -83,10 +83,34 @@ Whatever you type in the workflow input becomes:
 `package.json` version is essentially decorative now — the source of truth is the workflow input.
 
 ### Versioning Rule
-- Match upstream's MAJOR.MINOR when you sync (e.g., upstream is on `1.31.1`, after sync we go to `1.32.0`)
-- Bump PATCH (`1.32.0` → `1.32.1`) for fixes between syncs
-- Bump MINOR (`1.32.0` → `1.33.0`) for new features
-- **Never** use a `-suffix` like `-wsl.1` — `isNewerVersion()` treats hyphenated versions as pre-releases that won't trigger update prompts (unless user enables early access mode in KV store)
+
+A fork can't stay numerically in sync with an upstream that ships its own patches on its own schedule. Trying to "match their next number" breaks the moment upstream releases a patch you didn't anticipate. (That's exactly what happened: the fork shipped its own `1.32.1`/`1.32.2` fixes, then upstream released a *different* `1.32.1`.) So the fork tracks upstream in the parts of the version it controls, while making collisions structurally impossible.
+
+**Scheme: `<upstream MAJOR>.<upstream MINOR>.<PFF>`**
+- The patch's **hundreds digit (P)** = upstream's patch number.
+- The **low two digits (FF)** = the fork's own release sequence on that base.
+
+Two-part rule for the sequence:
+- Merging an upstream **patch** release `.Z` (where Z ≥ 1) → fork starts at **`.Z00`** (then `Z01`, `Z02`, …).
+- Merging an upstream **minor** release `.0` (a new minor) → fork starts at **`.001`** (then `002`, `003`, …) — not `.000`, so it reads as its own thing rather than a bare `.0`.
+
+| Upstream releases | Fork ships | Why |
+|---|---|---|
+| 1.32.0 | 1.32.001 | new minor → start at `.001` |
+| (fork-only fixes) | 1.32.002, 1.32.003 | increment low digits |
+| **1.32.1** | **1.32.100** | upstream patch 1 → `.100` |
+| (fork-only fixes) | 1.32.101, 1.32.102 | increment low digits |
+| 1.32.2 | 1.32.200 | upstream patch 2 → `.200` |
+| 1.33.0 | 1.33.001 | new minor → start at `.001` |
+| 1.33.1 | 1.33.100 | upstream patch 1 → `.100` |
+
+This works because upstream's SemVer patches (`.0`, `.1`, `.2`…) never reach 100 within a minor line, so the fork's `.100`+ numbers can never collide with a real upstream release. It stays monotonic across both fork-only releases and upstream re-syncs (e.g. `1.32.103` → `1.33.001` still increases because the minor went up).
+
+**Rules that keep it from breaking:**
+- **Never** match upstream's exact released number with a real fork release.
+- **Never** use a `-suffix` like `-wsl.1` — `isNewerVersion()` (`admin/app/utils/version.ts`) treats hyphenated versions as pre-releases that won't trigger update prompts (unless early access is enabled in the KV store). It compares each dot-segment numerically, so `1.32.100 > 1.32.2` works correctly.
+- Keep fork-only releases on a single upstream-patch base to ≤ 99 (e.g. `1.32.100`–`1.32.199`) before the next upstream patch takes over the next block. You will never realistically hit this.
+- The fork's in-app updater only ever queries the fork's own repo (`BigMoonTech/project-nomad-wsl` releases), so upstream's numbers never enter the comparison — this scheme is for human clarity and monotonicity, not for matching upstream.
 
 ---
 
@@ -239,7 +263,7 @@ Git will auto-merge what it can and stop on conflicts.
 
 ### Step 4: Resolve conflicts
 For each file with `<<<<<<<` markers:
-- **`package.json`**: Pick a new fork version (typically bump MINOR from your previous)
+- **`package.json`**: Set the new fork version per the Versioning Rule in Part 2 (merging upstream `.Z` → `.Z00`; merging a new upstream minor `.0` → `.001`)
 - **`system_service.ts`**: Keep our `BigMoonTech/project-nomad-wsl` URLs, take their other changes
 - **`Dockerfile`**: Keep our BigMoonTech labels, take any other upstream changes
 - **`install/management_compose.yaml`**: Keep our `ghcr.io/bigmoontech/*` image refs
@@ -310,6 +334,11 @@ Then follow Part 3 (release) if you want it deployed to your install.
 ### Merge with upstream produces tons of conflicts in service files
 - **Cause:** Cherry-picked PRs that are now officially merged upstream
 - **Fix:** Take upstream's version (`git checkout --theirs <file>`) — they have the same content as your cherry-pick anyway
+
+### Disk usage looks wrong on WSL2 (e.g. reports an empty/near-full disk, missing installed capacity)
+- **Context:** The disk-collector reads the host filesystem through the `/:/host:ro` bind mount and writes `/opt/project-nomad/storage/nomad-disk-info.json`, which the admin reads. On WSL2 the install script strips the `rslave` flag so the container can start (see Part 1), but it's not yet confirmed that the resulting figures are accurate under WSL2's mount layout.
+- **How to investigate:** `docker logs nomad_disk_collector --tail 50` (look for `lsblk --sysroot /host failed` or the `/storage` fallback message), then inspect `/opt/project-nomad/storage/nomad-disk-info.json` — compare its `fsSize`/`diskLayout` numbers against `df -h` in WSL2 and what Docker Desktop reports.
+- **Status:** Open. Don't document a "fix" here until the behavior is verified against a real install.
 
 ### Container starts but localhost:8080 shows nothing
 - **Cause:** Admin container is still initializing (migrations + manifest reconciliation can take 30–60 seconds)
@@ -386,21 +415,20 @@ That's the whole loop. Once you've done it once, every future release is the sam
 
 ---
 
-## Part 8: What We Built Together (Project Log)
+## Part 8: Fork Change Inventory
 
-For posterity. The fork was assembled in a single ~12 hour session with the following major milestones:
+The complete set of changes that distinguish this fork from upstream. Useful when auditing what might conflict during an upstream sync, or when onboarding to the fork's architecture.
 
-1. **Initial CLAUDE.md** — onboarding doc for future Claude sessions
-2. **Install script WSL2 detection** — `is_wsl()` function, conditional Docker checks (no systemctl), conditional GPU setup (no nvidia-container-toolkit, just verify Docker Desktop runtime)
-3. **Windows install README** — `install/windows/README.md` with prerequisites, GPU verification, install command
-4. **Disk collector mount fix** — replace `rslave` with plain `ro` on WSL2 (kept the sidecar instead of removing it)
-5. **CI pipeline rewiring** — all three build workflows publish to `ghcr.io/bigmoontech/*` instead of `crosstalk-solutions`
-6. **Sidecar updater fix** — sed pattern matches our image paths during in-app updates
-7. **Update flow rewiring** — `system_service.ts` GitHub API URL points to fork
-8. **Cherry-picked upstream PRs** #645, #649 (later officially merged in upstream sync)
-9. **`.wslconfig` resource tuning** — 28GB RAM, 20 CPU cores, 8GB swap
-10. **Upstream sync (28 commits)** — merged to v1.31.1+ with one trivial conflict
-11. **Fork identity polish** — README banner, Dockerfile labels, support page, debug modal, FAQ routing, issue template
-12. **First production release** — `v1.32.0` built across all three images, GitHub Release published, in-app update flow tested end-to-end with NVIDIA RTX 5070 Ti delivering 400+ tokens/sec on local Ollama
+1. **CLAUDE.md** — onboarding doc for Claude Code sessions working in the repo
+2. **Install script WSL2 detection** — `grep -qi microsoft /proc/version` gate; conditional Docker checks (skip `systemctl`), conditional GPU setup (skip `nvidia-container-toolkit`, verify Docker Desktop runtime instead)
+3. **Windows install guide** — `install/windows/README.md` with prerequisites, GPU verification, and install command
+4. **Disk-collector mount adjustment** — install script rewrites `/:/host:ro,rslave` → `/:/host:ro` on WSL2 (`rslave` propagation isn't supported there; the flag prevents the container from starting at all). The sidecar is kept, not removed. Upstream addresses the same root issue differently — by having the user set `mount --make-rshared /` in `wsl.conf`. Whether disk *figures* report correctly on WSL2 with the plain-`ro` approach is a separate, still-open question (see Part 6).
+5. **CI pipeline** — all three build workflows publish to `ghcr.io/bigmoontech/*` and drop upstream's `DEPLOYMENT_AUTHORIZED_USERS` auth check
+6. **Sidecar updater** — `sed` pattern in `update-watcher.sh` matches the fork's image paths during in-app updates
+7. **Update flow** — `system_service.ts` GitHub API URLs point to the fork's releases
+8. **Fork identity** — README "Unofficial Fork" banner, Dockerfile OCI labels, support page, debug modal, FAQ routing, issue templates
+9. **Versioning scheme** — fork-specific patch numbering (Part 2) to avoid collisions with upstream releases
 
-Onward to whatever comes next. 🚀
+### Hardware notes
+- GPU passthrough on WSL2 is handled entirely by Docker Desktop + the NVIDIA Windows driver (525.60.13+); confirmed working with NVIDIA discrete GPUs.
+- `.wslconfig` (RAM / CPU / swap) is tuned per-machine on the host and is not part of the repo.
