@@ -4,7 +4,8 @@ import { ServiceSlim } from '../../types/services'
 import { FileEntry } from '../../types/files'
 import { CheckLatestVersionResult, SystemInformationResponse, SystemUpdateStatus } from '../../types/system'
 import { DownloadJobWithProgress, WikipediaState } from '../../types/downloads'
-import { EmbedJobWithProgress } from '../../types/rag'
+import type { Country, CountryCode, CountryGroup, MapExtractPreflight } from '../../types/maps'
+import { EmbedJobWithProgress, FileWarningsResult, StoredFileInfo } from '../../types/rag'
 import type { CategoryWithStatus, CollectionWithStatus, ContentUpdateCheckResult, ResourceUpdateInfo } from '../../types/collections'
 import { catchInternal } from './util'
 import { NomadChatResponse, NomadInstalledModel, NomadOllamaModel, OllamaChatRequest } from '../../types/ollama'
@@ -126,6 +127,15 @@ class API {
       const response = await this.client.post<
         { filename: string; size: number } | { message: string }
       >('/maps/download-remote-preflight', { url })
+      return response.data
+    })()
+  }
+
+  async deleteMapRegionFile(filename: string): Promise<{ message: string }> {
+    return catchInternal(async () => {
+      const response = await this.client.delete<{ message: string }>(
+        `/maps/${encodeURIComponent(filename)}`
+      )
       return response.data
     })()
   }
@@ -258,6 +268,24 @@ class API {
   async getInstalledModels() {
     return catchInternal(async () => {
       const response = await this.client.get<NomadInstalledModel[]>('/ollama/installed-models')
+      return response.data
+    })()
+  }
+
+  /**
+   * Ask the backend to send Ollama `keep_alive: 0` to every currently-loaded
+   * chat model except `targetModel` (and the embedding model, which is always
+   * exempt server-side). Fire-and-forget — the chat UI doesn't await this
+   * before creating a new session, since unload is housekeeping.
+   *
+   * Pass `null` to unload every chat model.
+   */
+  async unloadChatModels(targetModel: string | null) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{ unloaded: string[] }>(
+        '/ollama/unload-chat-models',
+        { targetModel }
+      )
       return response.data
     })()
   }
@@ -451,10 +479,31 @@ class API {
     })()
   }
 
+  async checkRAGHealth() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{ online: boolean; message?: string }>('/rag/health')
+      return response.data
+    })()
+  }
+
   async getStoredRAGFiles() {
     return catchInternal(async () => {
-      const response = await this.client.get<{ files: string[] }>('/rag/files')
+      const response = await this.client.get<{ files: StoredFileInfo[] }>('/rag/files')
       return response.data.files
+    })()
+  }
+
+  async embedSingleRAGFile(source: string, force: boolean = false) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{ message: string }>('/rag/files/embed', { source, force })
+      return response.data
+    })()
+  }
+
+  async getKbFileWarnings() {
+    return catchInternal(async () => {
+      const response = await this.client.get<FileWarningsResult>('/rag/file-warnings')
+      return response.data
     })()
   }
 
@@ -541,6 +590,46 @@ class API {
     })()
   }
 
+  async listCountries() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{ countries: Country[] }>('/maps/countries')
+      return response.data.countries
+    })()
+  }
+
+  async listCountryGroups() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{ groups: CountryGroup[] }>('/maps/country-groups')
+      return response.data.groups
+    })()
+  }
+
+  async extractMapPreflight(params: { countries: CountryCode[]; maxzoom?: number }) {
+    return catchInternal(async () => {
+      const response = await this.client.post<MapExtractPreflight>(
+        '/maps/extract-preflight',
+        params
+      )
+      return response.data
+    })()
+  }
+
+  async extractMapRegion(params: {
+    countries: CountryCode[]
+    maxzoom?: number
+    label?: string
+    estimatedBytes?: number
+  }) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        message: string
+        filename: string
+        jobId?: string
+      }>('/maps/extract', params)
+      return response.data
+    })()
+  }
+
   async listCuratedMapCollections() {
     return catchInternal(async () => {
       const response = await this.client.get<CollectionWithStatus[]>(
@@ -574,7 +663,7 @@ class API {
   async listMapMarkers() {
     return catchInternal(async () => {
       const response = await this.client.get<
-        Array<{ id: number; name: string; longitude: number; latitude: number; color: string; created_at: string }>
+        Array<{ id: number; name: string; longitude: number; latitude: number; color: string; notes: string | null; created_at: string }>
       >('/maps/markers')
       return response.data
     })()
@@ -583,7 +672,7 @@ class API {
   async createMapMarker(data: { name: string; longitude: number; latitude: number; color?: string }) {
     return catchInternal(async () => {
       const response = await this.client.post<
-        { id: number; name: string; longitude: number; latitude: number; color: string; created_at: string }
+        { id: number; name: string; longitude: number; latitude: number; color: string; notes: string | null; created_at: string }
       >('/maps/markers', data)
       return response.data
     })()
@@ -621,6 +710,42 @@ class API {
           query,
         },
       })
+    })()
+  }
+
+  async listCustomLibraries() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{ id: number; name: string; base_url: string; is_default: boolean }[]>(
+        '/zim/custom-libraries'
+      )
+      return response.data
+    })()
+  }
+
+  async addCustomLibrary(name: string, base_url: string) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        message: string
+        library: { id: number; name: string; base_url: string }
+      }>('/zim/custom-libraries', { name, base_url })
+      return response.data
+    })()
+  }
+
+  async removeCustomLibrary(id: number) {
+    return catchInternal(async () => {
+      const response = await this.client.delete<{ message: string }>(`/zim/custom-libraries/${id}`)
+      return response.data
+    })()
+  }
+
+  async browseLibrary(url: string) {
+    return catchInternal(async () => {
+      const response = await this.client.get<{
+        directories: { name: string; url: string }[]
+        files: { name: string; url: string; size_bytes: number | null }[]
+      }>('/zim/browse-library', { params: { url } })
+      return response.data
     })()
   }
 
@@ -714,6 +839,52 @@ class API {
         filesScanned?: number
         filesQueued?: number
       }>('/rag/sync')
+      return response.data
+    })()
+  }
+
+  async reembedAllRAG() {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        success: boolean
+        message: string
+        filesScanned?: number
+        filesQueued?: number
+      }>('/rag/re-embed-all')
+      return response.data
+    })()
+  }
+
+  async resetAndRebuildRAG() {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        success: boolean
+        message: string
+        filesScanned?: number
+        filesQueued?: number
+      }>('/rag/reset-and-rebuild')
+      return response.data
+    })()
+  }
+
+  async estimateEmbeddingBatch(files: { filename: string; sizeBytes: number }[]) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        totalChunks: number
+        totalBytes: number
+        hasUnknown: boolean
+      }>('/rag/estimate-batch', { files })
+      return response.data
+    })()
+  }
+
+  async getKbPolicyPromptState() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{
+        shouldPrompt: boolean
+        hasContent: boolean
+        totalFiles: number
+      }>('/rag/policy-prompt-state')
       return response.data
     })()
   }

@@ -10,7 +10,7 @@ import { KiwixLibraryService } from './kiwix_library_service.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { exec } from 'child_process'
 import { promisify } from 'util'
-// import { readdir } from 'fs/promises'
+import { readFile } from 'node:fs/promises'
 import KVStore from '#models/kv_store'
 import { BROADCAST_CHANNELS } from '../../constants/broadcast.js'
 import { KIWIX_LIBRARY_CMD } from '../../constants/kiwix.js'
@@ -291,8 +291,12 @@ export class DockerService {
 
   /**
    * Force reinstall a service by stopping, removing, and recreating its container.
-   * This method will also clear any associated volumes/data.
-   * Handles edge cases gracefully (e.g., container not running, container not found).
+   *
+   * Volume handling: removes Docker-managed named volumes whose name equals
+   * `serviceName`, starts with `${serviceName}_`, or carries a `service=${serviceName}`
+   * label. Host bind mounts are NOT touched — any data living on a bind-mounted
+   * host path (ZIM stores, model caches, MySQL data dir, etc.) survives the reinstall.
+   * Anonymous volumes (random hash names) are also not matched.
    */
   async forceReinstall(serviceName: string): Promise<{ success: boolean; message: string }> {
     try {
@@ -365,7 +369,10 @@ export class DockerService {
         const volumes = await this.docker.listVolumes()
         const serviceVolumes =
           volumes.Volumes?.filter(
-            (v) => v.Name.includes(serviceName) || v.Labels?.service === serviceName
+            (v) =>
+              v.Name === serviceName ||
+              v.Name.startsWith(`${serviceName}_`) ||
+              v.Labels?.service === serviceName
           ) || []
 
         for (const vol of serviceVolumes) {
@@ -500,6 +507,7 @@ export class DockerService {
       // GPU-aware configuration for Ollama
       let finalImage = service.container_image
       let gpuHostConfig = containerConfig?.HostConfig || {}
+      let amdGpuConfigured = false
 
       if (service.service_name === SERVICE_NAMES.OLLAMA) {
         const gpuResult = await this._detectGPUType()
@@ -523,16 +531,51 @@ export class DockerService {
             ],
           }
         } else if (gpuResult.type === 'amd') {
-          this._broadcast(
-            service.service_name,
-            'gpu-config',
-            `AMD GPU detected. ROCm GPU acceleration is not yet supported in this version — proceeding with CPU-only configuration. GPU support for AMD will be available in a future update.`
-          )
-          logger.warn('[DockerService] AMD GPU detected but ROCm support is not yet enabled. Using CPU-only configuration.')
-          // TODO: Re-enable AMD GPU support once ROCm image and device discovery are validated.
-          // When re-enabling:
-          //   1. Switch image to 'ollama/ollama:rocm'
-          //   2. Restore _discoverAMDDevices() to map /dev/kfd and /dev/dri/* into the container
+          // AMD acceleration is opt-out via the 'ai.amdGpuAcceleration' KV key (default-on).
+          // Per memory feedback: KV values can be string or boolean — coerce explicitly.
+          const amdEnabledRaw = await KVStore.getValue('ai.amdGpuAcceleration')
+          const amdAccelerationEnabled = String(amdEnabledRaw) !== 'false'
+
+          if (amdAccelerationEnabled) {
+            this._broadcast(
+              service.service_name,
+              'gpu-config',
+              `AMD GPU detected. Using ROCm image with /dev/kfd and /dev/dri passthrough...`
+            )
+
+            finalImage = 'ollama/ollama:rocm'
+
+            // The pull-if-missing earlier in this function used service.container_image
+            // (the DB-pinned tag, e.g. ollama/ollama:0.18.2). The AMD branch overrides
+            // to a different tag — so we need to pull :rocm separately if it's not local.
+            const rocmImageExists = await this._checkImageExists(finalImage)
+            if (!rocmImageExists) {
+              this._broadcast(
+                service.service_name,
+                'pulling',
+                `Pulling Docker image ${finalImage}...`
+              )
+              const rocmPullStream = await this.docker.pull(finalImage)
+              await new Promise((res) => this.docker.modem.followProgress(rocmPullStream, res))
+            }
+
+            const amdDevices = await this._discoverAMDDevices()
+            gpuHostConfig = {
+              ...gpuHostConfig,
+              Devices: amdDevices,
+            }
+            amdGpuConfigured = true
+            logger.info(
+              `[DockerService] Configured ROCm image and ${amdDevices.length} AMD device entries for Ollama`
+            )
+          } else {
+            this._broadcast(
+              service.service_name,
+              'gpu-config',
+              `AMD GPU detected but acceleration is disabled via ai.amdGpuAcceleration. Using CPU-only configuration.`
+            )
+            logger.info('[DockerService] AMD GPU acceleration disabled by KV opt-out; using CPU-only configuration.')
+          }
         } else if (gpuResult.toolkitMissing) {
           this._broadcast(
             service.service_name,
@@ -554,6 +597,14 @@ export class DockerService {
         const flashAttentionEnabled = await KVStore.getValue('ai.ollamaFlashAttention')
         if (flashAttentionEnabled !== false) {
           ollamaEnv.push('OLLAMA_FLASH_ATTENTION=1')
+        }
+        if (amdGpuConfigured) {
+          // gfx-aware HSA override — only set for cards that actually need it. See
+          // _resolveAmdHsaOverride() for the resolution order and gfx → version mapping.
+          const hsaOverride = await this._resolveAmdHsaOverride()
+          if (hsaOverride) {
+            ollamaEnv.push(`HSA_OVERRIDE_GFX_VERSION=${hsaOverride}`)
+          }
         }
       }
 
@@ -857,7 +908,10 @@ export class DockerService {
   /**
    * Detect GPU type and toolkit availability.
    * Primary: Check Docker runtimes via docker.info() (works from inside containers).
-   * Fallback: lspci for host-based installs and AMD detection.
+   * Secondary: Read /app/storage/.nomad-gpu-type written by install_nomad.sh — needed
+   *   for AMD detection because lspci isn't available inside the admin container and
+   *   AMD has no Docker runtime registration to query.
+   * Fallback: lspci for host-based installs.
    */
   private async _detectGPUType(): Promise<{ type: 'nvidia' | 'amd' | 'none'; toolkitMissing?: boolean }> {
     try {
@@ -872,6 +926,24 @@ export class DockerService {
         }
       } catch (error: any) {
         logger.warn(`[DockerService] Could not query Docker info for GPU runtimes: ${error.message}`)
+      }
+
+      // Secondary: install_nomad.sh writes the host-detected GPU type to a marker file in
+      // the storage volume so the admin container (which lacks lspci) can read it.
+      try {
+        const marker = (await readFile('/app/storage/.nomad-gpu-type', 'utf8')).trim()
+        if (marker === 'nvidia') {
+          // Hardware present but Docker doesn't have nvidia runtime → toolkit missing
+          logger.warn('[DockerService] NVIDIA GPU recorded in marker file but NVIDIA Container Toolkit is not installed')
+          return { type: 'none', toolkitMissing: true }
+        }
+        if (marker === 'amd') {
+          logger.info('[DockerService] AMD GPU detected via install-time marker file')
+          await this._persistGPUType('amd')
+          return { type: 'amd' }
+        }
+      } catch {
+        // No marker file — fall through to lspci attempt for host-based installs
       }
 
       // Fallback: lspci for host-based installs (not available inside Docker)
@@ -937,60 +1009,84 @@ export class DockerService {
   }
 
   /**
-   * Discover AMD GPU DRI devices dynamically.
-   * Returns an array of device configurations for Docker.
+   * Resolve the HSA_OVERRIDE_GFX_VERSION value for the host's AMD GPU.
+   *
+   * gfx1030 (RX 6800/6700/etc.), gfx1100/1101/1102 (RX 7900/7800/7600) are on AMD's
+   * official ROCm allowlist — forcing an override on these breaks GPU discovery.
+   * gfx1035 / gfx1036 (RDNA 2 iGPUs like 680M) need 10.3.0 to coerce to gfx1030.
+   * gfx1103 / gfx1150 / gfx1151 (RDNA 3/3.5 iGPUs like 780M / 890M / Strix Halo) need 11.0.0.
+   *
+   * Resolution order:
+   *   1. KV `ai.amdHsaOverride` — manual user override; accepts 'none' (disable) or a semver-style value.
+   *   2. Marker file `/app/storage/.nomad-amd-gfx` written by install_nomad.sh.
+   *   3. Default: '11.0.0' — preserves prior behavior so existing iGPU users don't regress on
+   *      upgrade. Discrete-card users on existing installs can opt out via the KV.
+   *
+   * Returns null when no override should be applied.
    */
-  // private async _discoverAMDDevices(): Promise<
-  //   Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }>
-  // > {
-  //   try {
-  //     const devices: Array<{
-  //       PathOnHost: string
-  //       PathInContainer: string
-  //       CgroupPermissions: string
-  //     }> = []
+  private async _resolveAmdHsaOverride(): Promise<string | null> {
+    const manualRaw = await KVStore.getValue('ai.amdHsaOverride')
+    if (manualRaw !== null && manualRaw !== undefined && String(manualRaw).trim() !== '') {
+      const manual = String(manualRaw).trim().toLowerCase()
+      if (manual === 'none' || manual === 'off' || manual === 'false') {
+        logger.info('[DockerService] HSA override disabled via ai.amdHsaOverride')
+        return null
+      }
+      if (/^\d+\.\d+\.\d+$/.test(manual)) {
+        logger.info(`[DockerService] HSA override forced to ${manual} via ai.amdHsaOverride`)
+        return manual
+      }
+      logger.warn(`[DockerService] Ignoring invalid ai.amdHsaOverride value: ${manualRaw}`)
+    }
 
-  //     // Always add /dev/kfd (Kernel Fusion Driver)
-  //     devices.push({
-  //       PathOnHost: '/dev/kfd',
-  //       PathInContainer: '/dev/kfd',
-  //       CgroupPermissions: 'rwm',
-  //     })
+    try {
+      const gfx = (await readFile('/app/storage/.nomad-amd-gfx', 'utf8')).trim()
+      const mapped = this._mapGfxToHsaOverride(gfx)
+      logger.info(`[DockerService] AMD gfx marker '${gfx}' → HSA override ${mapped ?? 'none'}`)
+      return mapped
+    } catch {
+      // Marker absent — most likely an existing install upgraded without re-running
+      // install_nomad.sh. Fall through to the default.
+    }
 
-  //     // Discover DRI devices in /dev/dri/
-  //     try {
-  //       const driDevices = await readdir('/dev/dri')
-  //       for (const device of driDevices) {
-  //         const devicePath = `/dev/dri/${device}`
-  //         devices.push({
-  //           PathOnHost: devicePath,
-  //           PathInContainer: devicePath,
-  //           CgroupPermissions: 'rwm',
-  //         })
-  //       }
-  //       logger.info(
-  //         `[DockerService] Discovered ${driDevices.length} DRI devices: ${driDevices.join(', ')}`
-  //       )
-  //     } catch (error) {
-  //       logger.warn(`[DockerService] Could not read /dev/dri directory: ${error.message}`)
-  //       // Fallback to common device names if directory read fails
-  //       const fallbackDevices = ['card0', 'renderD128']
-  //       for (const device of fallbackDevices) {
-  //         devices.push({
-  //           PathOnHost: `/dev/dri/${device}`,
-  //           PathInContainer: `/dev/dri/${device}`,
-  //           CgroupPermissions: 'rwm',
-  //         })
-  //       }
-  //       logger.info(`[DockerService] Using fallback DRI devices: ${fallbackDevices.join(', ')}`)
-  //     }
+    logger.info('[DockerService] No AMD gfx marker; defaulting HSA override to 11.0.0 for backward compatibility')
+    return '11.0.0'
+  }
 
-  //     return devices
-  //   } catch (error) {
-  //     logger.error(`[DockerService] Error discovering AMD devices: ${error.message}`)
-  //     return []
-  //   }
-  // }
+  private _mapGfxToHsaOverride(gfx: string): string | null {
+    // Officially supported by ROCm — no override needed
+    if (gfx === 'gfx1030' || gfx === 'gfx1100' || gfx === 'gfx1101' || gfx === 'gfx1102') {
+      return null
+    }
+    // RDNA 2 variants + iGPUs (gfx1031..gfx1036, e.g. Rembrandt 680M)
+    if (/^gfx103[1-6]$/.test(gfx)) {
+      return '10.3.0'
+    }
+    // RDNA 3 / 3.5 mobile parts (Phoenix 780M = gfx1103, Strix 890M = gfx1150, Strix Halo = gfx1151)
+    if (gfx === 'gfx1103' || gfx === 'gfx1150' || gfx === 'gfx1151') {
+      return '11.0.0'
+    }
+    return '11.0.0'
+  }
+
+  /**
+   * Build the Docker Devices array for AMD GPU passthrough.
+   *
+   * Returns /dev/kfd (Kernel Fusion Driver, required by ROCm) and /dev/dri (the DRM
+   * device tree). Passing /dev/dri as a single directory entry mirrors Docker CLI
+   * --device behavior — the daemon expands it to all child devices (card*, renderD*)
+   * regardless of how the host enumerates them. This avoids the brittle hardcoded
+   * fallback (card0/renderD128) the prior implementation used, which was wrong on
+   * systems where the AMD GPU enumerates as card1+ (e.g. UM890 Pro 780M iGPU).
+   */
+  private async _discoverAMDDevices(): Promise<
+    Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }>
+  > {
+    return [
+      { PathOnHost: '/dev/kfd', PathInContainer: '/dev/kfd', CgroupPermissions: 'rwm' },
+      { PathOnHost: '/dev/dri', PathInContainer: '/dev/dri', CgroupPermissions: 'rwm' },
+    ]
+  }
 
   /**
    * Update a service container to a new image version while preserving volumes and data.
@@ -1014,16 +1110,68 @@ export class DockerService {
 
       this.activeInstallations.add(serviceName)
 
-      // Compute new image string
+      // newImage = the semver tag we record in the DB after the update (e.g. ollama/ollama:0.23.2).
+      // runtimeImage = the tag we actually pull and run. For AMD-on-Ollama these diverge: we run
+      // the rolling :rocm tag because per-version ROCm tags aren't always published, but the DB
+      // must keep the semver tag so the Apps page shows the actual version (not literally "rocm")
+      // and the registry update-check parses a valid tag (instead of looping on the same update).
       const currentImage = service.container_image
       const imageBase = currentImage.includes(':')
         ? currentImage.substring(0, currentImage.lastIndexOf(':'))
         : currentImage
       const newImage = `${imageBase}:${targetVersion}`
+      let runtimeImage = newImage
 
-      // Step 1: Pull new image
-      this._broadcast(serviceName, 'update-pulling', `Pulling image ${newImage}...`)
-      const pullStream = await this.docker.pull(newImage)
+      // GPU detection runs before the pull so AMD updates pull ollama/ollama:rocm rather
+      // than the standard tag. Detection result is reused below when building the new
+      // container config (devices, env). Non-Ollama services skip this entirely.
+      let updatedDeviceRequests: any[] | undefined = undefined
+      let updatedAmdDevices: any[] | undefined = undefined
+      let updatedAmdGpuConfigured = false
+      if (serviceName === SERVICE_NAMES.OLLAMA) {
+        const gpuResult = await this._detectGPUType()
+        if (gpuResult.type === 'nvidia') {
+          this._broadcast(
+            serviceName,
+            'update-gpu-config',
+            `NVIDIA container runtime detected. Configuring updated container with GPU support...`
+          )
+          updatedDeviceRequests = [
+            { Driver: 'nvidia', Count: -1, Capabilities: [['gpu']] },
+          ]
+        } else if (gpuResult.type === 'amd') {
+          const amdEnabledRaw = await KVStore.getValue('ai.amdGpuAcceleration')
+          const amdAccelerationEnabled = String(amdEnabledRaw) !== 'false'
+          if (amdAccelerationEnabled) {
+            this._broadcast(
+              serviceName,
+              'update-gpu-config',
+              `AMD GPU detected. Using ROCm image with /dev/kfd and /dev/dri passthrough...`
+            )
+            runtimeImage = 'ollama/ollama:rocm'
+            updatedAmdDevices = await this._discoverAMDDevices()
+            updatedAmdGpuConfigured = true
+          } else {
+            this._broadcast(
+              serviceName,
+              'update-gpu-config',
+              `AMD GPU detected but acceleration is disabled via ai.amdGpuAcceleration. Using CPU-only configuration.`
+            )
+          }
+        } else if (gpuResult.toolkitMissing) {
+          this._broadcast(
+            serviceName,
+            'update-gpu-config',
+            `NVIDIA GPU detected but NVIDIA Container Toolkit is not installed. Using CPU-only configuration. Install the toolkit and reinstall AI Assistant for GPU acceleration: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html`
+          )
+        } else {
+          this._broadcast(serviceName, 'update-gpu-config', `No GPU detected. Using CPU-only configuration.`)
+        }
+      }
+
+      // Step 1: Pull new image (runtimeImage diverges from newImage for AMD, see above)
+      this._broadcast(serviceName, 'update-pulling', `Pulling image ${runtimeImage}...`)
+      const pullStream = await this.docker.pull(runtimeImage)
       await new Promise((res) => this.docker.modem.followProgress(pullStream, res))
 
       // Step 2: Find and stop existing container
@@ -1054,48 +1202,23 @@ export class DockerService {
 
       const hostConfig = inspectData.HostConfig || {}
 
-      // Re-run GPU detection for Ollama so updates always reflect the current GPU environment.
-      // This handles cases where the NVIDIA Container Toolkit was installed after the initial
-      // Ollama setup, and ensures DeviceRequests are always built fresh rather than relying on
-      // round-tripping the Docker inspect format back into the create API.
-      let updatedDeviceRequests: any[] | undefined = undefined
-      if (serviceName === SERVICE_NAMES.OLLAMA) {
-        const gpuResult = await this._detectGPUType()
-
-        if (gpuResult.type === 'nvidia') {
-          this._broadcast(
-            serviceName,
-            'update-gpu-config',
-            `NVIDIA container runtime detected. Configuring updated container with GPU support...`
-          )
-          updatedDeviceRequests = [
-            {
-              Driver: 'nvidia',
-              Count: -1,
-              Capabilities: [['gpu']],
-            },
-          ]
-        } else if (gpuResult.type === 'amd') {
-          this._broadcast(
-            serviceName,
-            'update-gpu-config',
-            `AMD GPU detected. ROCm GPU acceleration is not yet supported — using CPU-only configuration.`
-          )
-        } else if (gpuResult.toolkitMissing) {
-          this._broadcast(
-            serviceName,
-            'update-gpu-config',
-            `NVIDIA GPU detected but NVIDIA Container Toolkit is not installed. Using CPU-only configuration. Install the toolkit and reinstall AI Assistant for GPU acceleration: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html`
-          )
-        } else {
-          this._broadcast(serviceName, 'update-gpu-config', `No GPU detected. Using CPU-only configuration.`)
+      // GPU detection already ran above (before the pull) so we know the right image, devices,
+      // and whether HSA_OVERRIDE needs injection. For AMD, replace any prior HSA_OVERRIDE in
+      // the inspect-captured env so updates from older containers pick up the current value.
+      const baseEnv = inspectData.Config?.Env || []
+      let finalEnv = baseEnv
+      if (updatedAmdGpuConfigured) {
+        const hsaOverride = await this._resolveAmdHsaOverride()
+        finalEnv = baseEnv.filter((e: string) => !e.startsWith('HSA_OVERRIDE_GFX_VERSION='))
+        if (hsaOverride) {
+          finalEnv.push(`HSA_OVERRIDE_GFX_VERSION=${hsaOverride}`)
         }
       }
 
       const newContainerConfig: any = {
-        Image: newImage,
+        Image: runtimeImage,
         name: serviceName,
-        Env: inspectData.Config?.Env || undefined,
+        Env: finalEnv.length > 0 ? finalEnv : undefined,
         Cmd: inspectData.Config?.Cmd || undefined,
         ExposedPorts: inspectData.Config?.ExposedPorts || undefined,
         WorkingDir: inspectData.Config?.WorkingDir || undefined,
@@ -1105,7 +1228,7 @@ export class DockerService {
           PortBindings: hostConfig.PortBindings || undefined,
           RestartPolicy: hostConfig.RestartPolicy || undefined,
           DeviceRequests: serviceName === SERVICE_NAMES.OLLAMA ? updatedDeviceRequests : (hostConfig.DeviceRequests || undefined),
-          Devices: hostConfig.Devices || undefined,
+          Devices: serviceName === SERVICE_NAMES.OLLAMA && updatedAmdDevices ? updatedAmdDevices : (hostConfig.Devices || undefined),
         },
         NetworkingConfig: inspectData.NetworkSettings?.Networks
           ? {
