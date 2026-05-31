@@ -15,6 +15,7 @@ import { readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import path, { join } from 'node:path'
 import { getAllFilesystems, getFile } from '../utils/fs.js'
+import { buildWsl2StorageDisk, isWsl2Kernel } from '../utils/wsl_disk.js'
 import axios from 'axios'
 import env from '#start/env'
 import KVStore from '#models/kv_store'
@@ -425,6 +426,18 @@ export class SystemService {
         }
         if (dockerInfo.KernelVersion) {
           os.kernel = dockerInfo.KernelVersion
+        }
+
+        // WSL2 + Docker Desktop: the disk-collector runs inside Docker Desktop's
+        // utility VM and can only see that VM's virtual disks, never the user's
+        // real storage. Replace the collector-derived disk list with the
+        // filesystem backing NOMAD's own /app/storage mount, which resolves to
+        // the WSL distro's virtual disk and reflects real content headroom.
+        if (isWsl2Kernel(dockerInfo.KernelVersion)) {
+          const wsl2Disk = buildWsl2StorageDisk(fsSize)
+          if (wsl2Disk.length > 0) {
+            disk = wsl2Disk
+          }
         }
 
         // si.graphics() in the admin container uses lspci (pciutils ships in
