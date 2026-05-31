@@ -24,6 +24,12 @@ Long answer: Custom storage paths, mount points, and external drives (like iSCSI
 
 **macOS and other non-Debian Linux distros** aren't officially supported. See [Why does NOMAD require a Debian-based OS?](#why-does-nomad-require-a-debian-based-os) for details.
 
+## Does the Windows install require editing `wsl.conf` or running `mount --make-rshared /`?
+
+No. On a Docker Desktop install, this fork's install script detects WSL2 and configures the disk-collector sidecar's mount automatically, so no changes to `/etc/wsl.conf` and no `mount --make-rshared /` step are required.
+
+Background: the disk-collector reads host disk usage through a `/:/host:ro,rslave` bind mount, and the `rslave` flag requires WSL2's root filesystem to be a shared mount, which it is not by default. The upstream community WSL2 guide resolves this by reconfiguring WSL (enabling systemd and adding `mount --make-rshared /` to `wsl.conf`); this fork instead rewrites the sidecar's own mount to a plain read-only bind that starts without any environment changes. See [install/windows/README.md](install/windows/README.md) for details.
+
 ## Why does NOMAD require a Debian-based OS?
 
 Project N.O.M.A.D. is currently designed to run on Debian-based Linux distributions (with Ubuntu being the recommended distro) because our installation scripts and Docker configurations are optimized for this environment. While it's technically possible to run the Docker containers on other operating systems that support Docker, we have not tested or optimized the installation process for non-Debian-based systems, so we cannot guarantee a smooth experience on those platforms at this time.

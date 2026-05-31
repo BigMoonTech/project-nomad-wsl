@@ -19,7 +19,7 @@
 >
 > **This is an unofficial fork of [Project N.O.M.A.D.](https://github.com/Crosstalk-Solutions/project-nomad) by [Crosstalk Solutions](https://crosstalksolutions.com), maintained by [BigMoonTech](https://github.com/BigMoonTech) to add first-class **Windows + WSL2 + Docker Desktop** support.
 >
-> The original project targets Debian/Ubuntu Linux only. This fork detects WSL2 automatically and adapts the install/update flow accordingly — including correct NVIDIA GPU passthrough via Docker Desktop and the Windows NVIDIA driver. Native Linux installs continue to work unchanged.
+> The original project targets Debian/Ubuntu Linux only. This fork detects WSL2 automatically and adapts the install and update flow accordingly — including correct NVIDIA GPU passthrough via Docker Desktop and the Windows NVIDIA driver, and automatic handling of WSL2's mount differences with no manual `wsl.conf` changes required. Native Linux installs continue to work unchanged.
 >
 > **For official support, the upstream project, and the wider N.O.M.A.D. community, see the [original repository](https://github.com/Crosstalk-Solutions/project-nomad). For Windows/WSL2-specific issues, use [this fork's issue tracker](https://github.com/BigMoonTech/project-nomad-wsl/issues).**
 
@@ -53,6 +53,14 @@ sudo bash install_nomad.sh
 Then in your **Ubuntu WSL2 terminal**, run the same install command above. The script detects WSL2 automatically and adapts (skips systemctl, skips nvidia-container-toolkit, verifies Docker Desktop instead).
 
 For the full Windows walkthrough, see [install/windows/README.md](install/windows/README.md).
+
+#### Windows support and the WSL2 mount
+
+On standard Linux, the disk-collector sidecar reads host disk usage through a `/:/host:ro,rslave` bind mount. The `rslave` propagation flag requires the host root (`/`) to be a shared mount, but WSL2 mounts `/` as private by default, so on Windows that mount is rejected and the container does not start.
+
+The upstream community WSL2 guide resolves this by reconfiguring WSL itself — enabling systemd and adding `mount --make-rshared /` to `/etc/wsl.conf`, then restarting WSL. This fork takes a different approach: the install script detects WSL2 and rewrites the sidecar's own mount to a plain read-only bind (`/:/host:ro`), which starts cleanly with no changes to the WSL environment. The outcome is the same — the disk-collector runs — but the platform difference is absorbed by the installer rather than handed off as a set of manual system changes. This keeps the change scoped to NOMAD's own container instead of altering mount propagation for the entire distribution.
+
+On Windows, this fork supports Docker Desktop (with WSL2 integration) as the container runtime. Docker Desktop manages WSL2 integration and NVIDIA GPU passthrough through the Windows driver, which keeps the install path simple and reliable. Other Windows container configurations are not supported.
 
 ---
 

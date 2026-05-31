@@ -2,6 +2,12 @@
 
 This guide walks through installing Project N.O.M.A.D. on Windows 10/11 using WSL2 (Windows Subsystem for Linux) and Docker Desktop. The same Linux install script is used — WSL2 provides a full Ubuntu environment and Docker Desktop provides the container engine.
 
+## Supported setup and WSL2 mount handling
+
+This fork supports Docker Desktop with WSL2 integration as the Windows container runtime. The install script applies all WSL2-specific adjustments automatically; no changes to `/etc/wsl.conf` and no `mount --make-rshared /` step are required.
+
+The detail behind that: on standard Linux, Project N.O.M.A.D.'s disk-collector sidecar reads host disk usage through a `/:/host:ro,rslave` bind mount. The `rslave` propagation flag requires the host root (`/`) to be a shared mount. WSL2 mounts `/` as private by default, so without intervention the container fails to start with the error `path / is mounted on / but it is not a shared or slave mount`. The upstream community WSL2 guide handles this by reconfiguring WSL — enabling systemd and adding `mount --make-rshared /` to `/etc/wsl.conf`, then running `wsl --shutdown`. This fork instead detects WSL2 during installation and rewrites the sidecar's mount to a plain `/:/host:ro` bind, which starts without any WSL configuration changes.
+
 ## Prerequisites
 
 ### System Requirements

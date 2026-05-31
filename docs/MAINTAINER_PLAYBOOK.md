@@ -422,7 +422,7 @@ The complete set of changes that distinguish this fork from upstream. Useful whe
 1. **CLAUDE.md** — onboarding doc for Claude Code sessions working in the repo
 2. **Install script WSL2 detection** — `grep -qi microsoft /proc/version` gate; conditional Docker checks (skip `systemctl`), conditional GPU setup (skip `nvidia-container-toolkit`, verify Docker Desktop runtime instead)
 3. **Windows install guide** — `install/windows/README.md` with prerequisites, GPU verification, and install command
-4. **Disk-collector mount adjustment** — install script rewrites `/:/host:ro,rslave` → `/:/host:ro` on WSL2 (`rslave` propagation isn't supported there; the flag prevents the container from starting at all). The sidecar is kept, not removed. Upstream addresses the same root issue differently — by having the user set `mount --make-rshared /` in `wsl.conf`. Whether disk *figures* report correctly on WSL2 with the plain-`ro` approach is a separate, still-open question (see Part 6).
+4. **Disk-collector mount adjustment** — install script rewrites `/:/host:ro,rslave` → `/:/host:ro` on WSL2 (`rslave` propagation isn't supported there; the flag prevents the container from starting at all). The sidecar is kept, not removed. Upstream addresses the same root issue differently — by having the user set `mount --make-rshared /` in `wsl.conf`. Whether disk *figures* report correctly on WSL2 with the plain-`ro` approach is a separate, still-open question (see Part 6). Full rationale in Part 9.
 5. **CI pipeline** — all three build workflows publish to `ghcr.io/bigmoontech/*` and drop upstream's `DEPLOYMENT_AUTHORIZED_USERS` auth check
 6. **Sidecar updater** — `sed` pattern in `update-watcher.sh` matches the fork's image paths during in-app updates
 7. **Update flow** — `system_service.ts` GitHub API URLs point to the fork's releases
@@ -432,3 +432,40 @@ The complete set of changes that distinguish this fork from upstream. Useful whe
 ### Hardware notes
 - GPU passthrough on WSL2 is handled entirely by Docker Desktop + the NVIDIA Windows driver (525.60.13+); confirmed working with NVIDIA discrete GPUs.
 - `.wslconfig` (RAM / CPU / swap) is tuned per-machine on the host and is not part of the repo.
+
+---
+
+## Part 9: WSL2 Disk-Collector Mount Handling
+
+### Summary
+
+On WSL2 the install script rewrites the disk-collector sidecar's host bind mount from `/:/host:ro,rslave` to `/:/host:ro`. This is the fork's equivalent of the manual `wsl.conf` + `mount --make-rshared /` step documented in the upstream community WSL2 guide. Both achieve the same result — the sidecar starts and collects host disk information — but the fork performs the adjustment automatically in the installer rather than requiring host reconfiguration.
+
+### Why `rslave` fails on WSL2
+
+The disk-collector reads host block-device and filesystem information through a bind mount, `/:/host`, declared in `management_compose.yaml` as `ro,rslave`. The `rslave` flag enables slave mount propagation so that filesystems mounted on the host after the container starts remain visible inside it. This is the conventional pattern for host-introspection sidecars (Prometheus node-exporter uses the same approach) and is correct on standard Linux hosts.
+
+`rslave` requires the host root (`/`) to be a shared or slave mount. WSL2 mounts `/` as a private mount by default, so the bind mount is invalid and the container fails to start. Docker reports:
+
+```
+docker: Error response from daemon: path / is mounted on / but it is not a shared or slave mount.
+```
+
+### The two approaches
+
+- **Upstream (community WSL2 guide):** the operator reconfigures WSL. `/etc/wsl.conf` is set to enable systemd and run `mount --make-rshared /` at boot, followed by `wsl --shutdown`. This makes `/` a shared mount so `rslave` becomes valid. The change is global to the distribution, and the manual `mount --make-rshared /` does not persist across `wsl --shutdown` unless written to `wsl.conf`.
+- **This fork (install script):** WSL2 is detected via `grep -qi microsoft /proc/version`, and the sidecar's own mount is rewritten to `/:/host:ro` (`install/install_nomad.sh`). A read-only bind mount carries no shared/slave requirement and starts with no changes to the host. `rslave` only provided visibility of mounts added *after* container start; on a WSL2 desktop nothing hot-plugs into the VM that way, and all filesystems present at start are already visible. The single trade-off — no auto-visibility of later hot-plugged drives — is irrelevant for this environment.
+
+### Why the install-script approach is preferred here
+
+- The platform adaptation belongs in the application's installer, not in a list of manual host edits. The software conforms to the platform; the platform is not reconfigured to suit one container.
+- The change is scoped to NOMAD's own container rather than altering mount propagation for the entire WSL distribution.
+- Under Docker Desktop — the supported Windows runtime — the engine, and therefore the `/host` mount, resolves against Docker's own utility VM (`docker-desktop`), not the operator's distribution. A `mount --make-rshared /` applied to the distribution root does not govern the filesystem the bind mount actually resolves against, so the plain-`ro` rewrite is the correct lever for Docker Desktop specifically.
+
+### Support scope
+
+On Windows, this fork targets Docker Desktop with WSL2 integration as the supported container runtime. Docker Desktop manages WSL2 integration and NVIDIA GPU passthrough through the Windows driver and is actively maintained; standardizing on a single, well-understood runtime keeps the install path reliable and testable. Native-Docker-in-WSL and other runtimes are out of scope for this fork.
+
+### Related
+
+This concerns only whether the disk-collector *starts* and reads data. Whether the resulting disk *figures* are presented correctly in the System → Storage Devices panel on WSL2 is a separate matter tracked in Part 6.
