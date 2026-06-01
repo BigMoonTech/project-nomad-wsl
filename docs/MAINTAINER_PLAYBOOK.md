@@ -335,10 +335,12 @@ Then follow Part 3 (release) if you want it deployed to your install.
 - **Cause:** Cherry-picked PRs that are now officially merged upstream
 - **Fix:** Take upstream's version (`git checkout --theirs <file>`) — they have the same content as your cherry-pick anyway
 
-### Disk usage looks wrong on WSL2 (e.g. reports an empty/near-full disk, missing installed capacity)
-- **Context:** The disk-collector reads the host filesystem through the `/:/host:ro` bind mount and writes `/opt/project-nomad/storage/nomad-disk-info.json`, which the admin reads. On WSL2 the install script strips the `rslave` flag so the container can start (see Part 1), but it's not yet confirmed that the resulting figures are accurate under WSL2's mount layout.
-- **How to investigate:** `docker logs nomad_disk_collector --tail 50` (look for `lsblk --sysroot /host failed` or the `/storage` fallback message), then inspect `/opt/project-nomad/storage/nomad-disk-info.json` — compare its `fsSize`/`diskLayout` numbers against `df -h` in WSL2 and what Docker Desktop reports.
-- **Status:** Open. Don't document a "fix" here until the behavior is verified against a real install.
+### Disk usage looked wrong on WSL2 — FIXED in v1.32.101
+- **Symptom (pre-fix):** the System → Storage panel showed Docker Desktop's internal disk (an `overlay` reading near the ~1 TB Docker-VM ceiling), not the disk NOMAD's content lives on.
+- **Root cause:** the disk-collector runs *inside Docker Desktop's own utility VM* (`docker-desktop`), so through its `/:/host` mount it only sees that VM's virtual disks — never the user's real storage. The actual NOMAD data lives on the WSL distro's own virtual disk, and the physical drive arrives only as a `9p` mount, which the admin's `type === 'disk'` block-device filter dropped. The disk-collector itself is **unchanged** — it still only sees Docker's VM.
+- **Fix (admin-side):** `getSystemInfo` now detects WSL2 from the kernel tag (`microsoft-standard-WSL2`) and, on WSL2, builds the Storage panel from the filesystem backing `/app/storage` — the WSL VM disk where content actually lives — instead of the collector's disk list. Helpers: `admin/app/utils/wsl_disk.ts` (`isWsl2Kernel`, `buildWsl2StorageDisk`), wired in `system_service.ts`. Native Linux is unchanged.
+- **Verify:** System → Storage shows a single **NOMAD Storage** device at the WSL disk's real usage (e.g. ~408 GB / ~1006 GB). Raw data: `docker exec nomad_admin df -Pk /app/storage`.
+- **Known limitation:** the panel reports the WSL virtual disk (and its ~1 TB default ceiling), not the underlying physical drive — which physical drive backs the VM isn't reliably knowable from inside a container.
 
 ### Container starts but localhost:8080 shows nothing
 - **Cause:** Admin container is still initializing (migrations + manifest reconciliation can take 30–60 seconds)
@@ -422,7 +424,7 @@ The complete set of changes that distinguish this fork from upstream. Useful whe
 1. **CLAUDE.md** — onboarding doc for Claude Code sessions working in the repo
 2. **Install script WSL2 detection** — `grep -qi microsoft /proc/version` gate; conditional Docker checks (skip `systemctl`), conditional GPU setup (skip `nvidia-container-toolkit`, verify Docker Desktop runtime instead)
 3. **Windows install guide** — `install/windows/README.md` with prerequisites, GPU verification, and install command
-4. **Disk-collector mount adjustment** — install script rewrites `/:/host:ro,rslave` → `/:/host:ro` on WSL2 (`rslave` propagation isn't supported there; the flag prevents the container from starting at all). The sidecar is kept, not removed. Upstream addresses the same root issue differently — by having the user set `mount --make-rshared /` in `wsl.conf`. Whether disk *figures* report correctly on WSL2 with the plain-`ro` approach is a separate, still-open question (see Part 6).
+4. **Disk-collector mount adjustment** — install script rewrites `/:/host:ro,rslave` → `/:/host:ro` on WSL2 (`rslave` propagation isn't supported there; the flag prevents the container from starting at all). The sidecar is kept, not removed. Upstream addresses the same root issue differently — by having the user set `mount --make-rshared /` in `wsl.conf`. Whether disk *figures* report correctly on WSL2 with the plain-`ro` approach was a separate concern, resolved in v1.32.101 (see Part 6). Full rationale in Part 9.
 5. **CI pipeline** — all three build workflows publish to `ghcr.io/bigmoontech/*` and drop upstream's `DEPLOYMENT_AUTHORIZED_USERS` auth check
 6. **Sidecar updater** — `sed` pattern in `update-watcher.sh` matches the fork's image paths during in-app updates
 7. **Update flow** — `system_service.ts` GitHub API URLs point to the fork's releases
@@ -432,3 +434,40 @@ The complete set of changes that distinguish this fork from upstream. Useful whe
 ### Hardware notes
 - GPU passthrough on WSL2 is handled entirely by Docker Desktop + the NVIDIA Windows driver (525.60.13+); confirmed working with NVIDIA discrete GPUs.
 - `.wslconfig` (RAM / CPU / swap) is tuned per-machine on the host and is not part of the repo.
+
+---
+
+## Part 9: WSL2 Disk-Collector Mount Handling
+
+### Summary
+
+On WSL2 the install script rewrites the disk-collector sidecar's host bind mount from `/:/host:ro,rslave` to `/:/host:ro`. This is the fork's equivalent of the manual `wsl.conf` + `mount --make-rshared /` step documented in the upstream community WSL2 guide. Both achieve the same result — the sidecar starts and collects host disk information — but the fork performs the adjustment automatically in the installer rather than requiring host reconfiguration.
+
+### Why `rslave` fails on WSL2
+
+The disk-collector reads host block-device and filesystem information through a bind mount, `/:/host`, declared in `management_compose.yaml` as `ro,rslave`. The `rslave` flag enables slave mount propagation so that filesystems mounted on the host after the container starts remain visible inside it. This is the conventional pattern for host-introspection sidecars (Prometheus node-exporter uses the same approach) and is correct on standard Linux hosts.
+
+`rslave` requires the host root (`/`) to be a shared or slave mount. WSL2 mounts `/` as a private mount by default, so the bind mount is invalid and the container fails to start. Docker reports:
+
+```
+docker: Error response from daemon: path / is mounted on / but it is not a shared or slave mount.
+```
+
+### The two approaches
+
+- **Upstream (community WSL2 guide):** the operator reconfigures WSL. `/etc/wsl.conf` is set to enable systemd and run `mount --make-rshared /` at boot, followed by `wsl --shutdown`. This makes `/` a shared mount so `rslave` becomes valid. **Scope nuance:** `/etc/wsl.conf` is *per-distribution* (it lives inside the distro), not the Windows-host-global `.wslconfig` — so the change is distribution-scoped, not literally system-wide across Windows, and a user could even isolate NOMAD in a dedicated distro to contain it. It is still an edit to that distribution's system config: it enables systemd and flips `/`'s mount propagation for everything in that distribution, requires a full `wsl --shutdown`, and persists until manually removed (upstream's uninstaller does not revert it). The live `mount --make-rshared /` does not persist across `wsl --shutdown` on its own — the `wsl.conf` `command=` line re-applies it each boot.
+- **This fork (install script):** WSL2 is detected via `grep -qi microsoft /proc/version`, and the sidecar's own mount is rewritten to `/:/host:ro` (`install/install_nomad.sh`). A read-only bind mount carries no shared/slave requirement and starts with no changes to the host. `rslave` only provided visibility of mounts added *after* container start; on a WSL2 desktop nothing hot-plugs into the VM that way, and all filesystems present at start are already visible. The single trade-off — no auto-visibility of later hot-plugged drives — is irrelevant for this environment.
+
+### Why the install-script approach is preferred here
+
+- The platform adaptation belongs in the application's installer, not in a list of manual host edits. The software conforms to the platform; the platform is not reconfigured to suit one container.
+- The change is scoped to NOMAD's own container rather than altering mount propagation for the entire WSL distribution.
+- Under Docker Desktop — the supported Windows runtime — the engine, and therefore the `/host` mount, resolves against Docker's own utility VM (`docker-desktop`), not the operator's distribution. A `mount --make-rshared /` applied to the distribution root does not govern the filesystem the bind mount actually resolves against, so the plain-`ro` rewrite is the correct lever for Docker Desktop specifically.
+
+### Support scope
+
+On Windows, this fork **requires** Docker Desktop with WSL2 integration as the supported container runtime. Docker Desktop manages WSL2 integration and NVIDIA GPU passthrough through the Windows driver and is actively maintained; standardizing on a single, well-understood runtime keeps the install path reliable and testable. Native-Docker-in-WSL and other runtimes are out of scope for this fork.
+
+### Related
+
+This concerns only whether the disk-collector *starts* and reads data. The separate question of whether the resulting disk *figures* are presented correctly in the System → Storage Devices panel on WSL2 has since been **resolved in v1.32.101** (see Part 6).

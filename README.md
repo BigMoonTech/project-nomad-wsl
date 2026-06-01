@@ -19,7 +19,7 @@
 >
 > **This is an unofficial fork of [Project N.O.M.A.D.](https://github.com/Crosstalk-Solutions/project-nomad) by [Crosstalk Solutions](https://crosstalksolutions.com), maintained by [BigMoonTech](https://github.com/BigMoonTech) to add first-class **Windows + WSL2 + Docker Desktop** support.
 >
-> The original project targets Debian/Ubuntu Linux only. This fork detects WSL2 automatically and adapts the install/update flow accordingly — including correct NVIDIA GPU passthrough via Docker Desktop and the Windows NVIDIA driver. Native Linux installs continue to work unchanged.
+> The original project targets Debian/Ubuntu Linux only. This fork detects WSL2 automatically and adapts the install and update flow accordingly — including correct NVIDIA GPU passthrough via Docker Desktop and the Windows NVIDIA driver, and automatic handling of WSL2's mount differences with no manual `wsl.conf` changes required. Native Linux installs continue to work unchanged.
 >
 > **For official support, the upstream project, and the wider N.O.M.A.D. community, see the [original repository](https://github.com/Crosstalk-Solutions/project-nomad). For Windows/WSL2-specific issues, use [this fork's issue tracker](https://github.com/BigMoonTech/project-nomad-wsl/issues).**
 
@@ -53,6 +53,16 @@ sudo bash install_nomad.sh
 Then in your **Ubuntu WSL2 terminal**, run the same install command above. The script detects WSL2 automatically and adapts (skips systemctl, skips nvidia-container-toolkit, verifies Docker Desktop instead).
 
 For the full Windows walkthrough, see [install/windows/README.md](install/windows/README.md).
+
+#### How this fork differs from the upstream WSL2 guide
+
+Running NOMAD on Windows surfaces two WSL2-specific issues. The upstream community WSL2 guide addresses the first; this fork handles both — automatically, and with no manual configuration.
+
+**Getting the app to start.** NOMAD's disk-collector sidecar reads host disk usage through a `/:/host:ro,rslave` bind mount. The `rslave` flag requires the host root (`/`) to be a shared mount, but WSL2 mounts `/` as private by default, so the container is rejected and won't start. The upstream guide resolves this by having the user reconfigure WSL — enabling systemd and adding `mount --make-rshared /` to `/etc/wsl.conf`, then restarting WSL. That file is **per-distribution** (it lives inside the WSL distro, not the Windows-global `.wslconfig`), so it's scoped to that one distribution rather than the whole Windows host — but it still edits the distribution's system config, needs a full `wsl --shutdown`, affects everything else in that distribution, and persists until manually removed. This fork instead detects WSL2 at install time and rewrites the sidecar's own mount to a plain read-only bind (`/:/host:ro`), so the app starts with no `wsl.conf` changes in any distribution — nothing for the user to edit and nothing left behind.
+
+**Reporting the right storage.** Starting the app is only half the problem. Under Docker Desktop the disk-collector runs inside Docker Desktop's own utility VM, so it only ever sees *Docker's* virtual disks — which is why a stock build (or an upstream install that simply followed the guide) reports Docker Desktop's internal cache disk under **System → Storage**, not the disk your content lives on. This fork goes a step further: on WSL2 the Command Center detects the environment and reports your **WSL virtual disk** — the disk that actually holds your ZIM files, models, and uploads — so the Storage panel shows real capacity and usage instead of a misleading default.
+
+On Windows, this fork **requires Docker Desktop** (with WSL2 integration) and supports only that runtime — installing Docker natively inside the WSL distribution is **not** supported. Docker Desktop handles WSL2 integration for you and routes NVIDIA GPU passthrough through the Windows driver, so there's nothing to install or configure inside Linux. Standardizing on a single, actively-maintained, well-understood runtime keeps the install path simple, reliable, and testable — rather than half-supporting several — which is what a turn-key offline appliance needs.
 
 ---
 

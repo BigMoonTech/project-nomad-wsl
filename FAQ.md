@@ -24,6 +24,20 @@ Long answer: Custom storage paths, mount points, and external drives (like iSCSI
 
 **macOS and other non-Debian Linux distros** aren't officially supported. See [Why does NOMAD require a Debian-based OS?](#why-does-nomad-require-a-debian-based-os) for details.
 
+## Do I need Docker Desktop, or can I install Docker inside WSL?
+
+This fork **requires Docker Desktop** with WSL2 integration and supports only that path — installing Docker natively inside the WSL distribution is not supported. Docker Desktop handles WSL2 integration and NVIDIA GPU passthrough for you (through the Windows driver, with nothing to set up inside Linux), and focusing on a single, actively-maintained runtime keeps the install simple and reliable to support. The upstream community guide also documents a native-Docker-in-WSL path; that path is outside this fork's scope.
+
+## Does the Windows install require editing `wsl.conf` or running `mount --make-rshared /`?
+
+No. On a Docker Desktop install, this fork's install script detects WSL2 and configures the disk-collector sidecar's mount automatically, so no changes to `/etc/wsl.conf` and no `mount --make-rshared /` step are required.
+
+Background: the disk-collector reads host disk usage through a `/:/host:ro,rslave` bind mount, and the `rslave` flag requires WSL2's root filesystem to be a shared mount, which it is not by default. The upstream community WSL2 guide resolves this by reconfiguring WSL (enabling systemd and adding `mount --make-rshared /` to `wsl.conf`, the per-distribution config inside the distro — not the Windows-global `.wslconfig`); this fork instead rewrites the sidecar's own mount to a plain read-only bind that starts without any `wsl.conf` changes. See [install/windows/README.md](install/windows/README.md) for details.
+
+## Why does the Storage panel show a ~1 TB virtual disk on Windows instead of my physical drive?
+
+On WSL2, NOMAD's content lives inside the WSL distribution's own virtual disk — a dynamically-expanding file with a **default 1 TB maximum** (see [Microsoft's WSL disk-space docs](https://learn.microsoft.com/windows/wsl/disk-space)) that itself sits on your physical drive. The System → Storage panel reports that virtual disk's real usage, which is the meaningful number for how much room your content has. It does **not** show the physical drive because, from inside a container, which physical drive backs the WSL VM can't be reliably determined — so NOMAD reports what it can stand behind rather than guessing. (Before v1.32.101 the panel instead showed Docker Desktop's internal cache disk, which was misleading; that's now fixed.)
+
 ## Why does NOMAD require a Debian-based OS?
 
 Project N.O.M.A.D. is currently designed to run on Debian-based Linux distributions (with Ubuntu being the recommended distro) because our installation scripts and Docker configurations are optimized for this environment. While it's technically possible to run the Docker containers on other operating systems that support Docker, we have not tested or optimized the installation process for non-Debian-based systems, so we cannot guarantee a smooth experience on those platforms at this time.
