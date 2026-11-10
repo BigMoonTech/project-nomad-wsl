@@ -33,13 +33,14 @@ FROM base AS deps
 WORKDIR /app
 ADD admin/package.json admin/package-lock.json ./
 # The package installer skips its network fetch when the archive already exists.
+# Use the base image’s matching Node headers for concurrent native addon builds.
 RUN --mount=type=bind,from=libzim,source=/archives,target=/archives \
     npm ci --ignore-scripts \
     && dest=node_modules/@openzim/libzim/download \
     && mkdir -p "$dest" \
     && cp /archives/*.tar.gz "$dest/" \
     && tar -xzf /archives/*.tar.gz --strip-components=1 -C "$dest" \
-    && npm rebuild \
+    && npm_config_nodedir=/usr/local npm rebuild \
     && rm "$dest"/*.tar.gz
 
 FROM deps AS production-deps
