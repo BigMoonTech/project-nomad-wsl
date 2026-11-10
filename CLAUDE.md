@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Project N.O.M.A.D. (Node for Offline Media, Archives, and Data) is an offline-first knowledge and education server. It provides a "Command Center" web UI that orchestrates containerized tools (AI chat, offline Wikipedia, maps, education platform, etc.) via Docker. This fork targets Windows deployment using WSL2 and Docker Desktop.
+Project N.O.M.A.D. (Node for Offline Media, Archives, and Data) is an offline-first knowledge and education server. It provides a "Command Center" web UI that orchestrates containerized tools (AI chat, offline Wikipedia, maps, education platform, etc.) via Docker. This fork supports Windows using WSL2 and Docker Desktop, and native x86-64 and ARM64 Linux using Docker Engine.
 
 ## Development Commands
 
@@ -111,14 +111,14 @@ These are Docker containers managed by the Command Center UI:
 ## Conventions
 
 - **Conventional Commits**: `feat(scope):`, `fix(scope):`, `docs:`, `refactor:`, `chore:`, `test:`
-- **Branching**: Feature branches off `dev` (e.g., `fix/issue-123`, `feature/add-new-tool`). PRs target `dev`.
-- **Versioning**: Root `package.json` version managed by semantic-release. `admin/package.json` stays at `0.0.0` — do not change it.
+- **Branching**: Both platforms use the fork’s `main`. Use short-lived integration branches and target pull requests at BigMoonTech/project-nomad-wsl.
+- **Versioning**: Use the fork numbering and manual release workflows in `docs/MAINTAINER_PLAYBOOK.md`. `admin/package.json` stays at `0.0.0` — do not change it.
 - **Release notes**: Maintained in `admin/docs/release-notes.md` by maintainers, not in PRs.
 - **Module imports**: Use `#` subpath imports (e.g., `#services/docker_service`, `#models/service`). Defined in `admin/package.json` `imports` field.
 
 ## Windows/WSL2 Deployment
 
-This fork targets Windows via **WSL2 Ubuntu + Docker Desktop**. The install script (`install/install_nomad.sh`) detects WSL2 automatically via `grep -qi microsoft /proc/version` and adjusts its behavior:
+On Windows, this fork uses **WSL2 Ubuntu + Docker Desktop**. The install script (`install/install_nomad.sh`) detects WSL2 automatically via `grep -qi microsoft /proc/version` and adjusts its behavior:
 
 - **Docker:** Provided by Docker Desktop, not installed via apt. Script skips `systemctl` checks and uses `docker info` to verify the daemon.
 - **NVIDIA GPU:** Handled entirely by Docker Desktop + the NVIDIA Windows driver (525.60.13+). The script skips `nvidia-container-toolkit` installation and `daemon.json` modification on WSL2 — those are for native Linux only.

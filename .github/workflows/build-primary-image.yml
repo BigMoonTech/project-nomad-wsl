@@ -13,31 +13,25 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
-    name: Build Docker image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          push: true
-          tags: |
-            ghcr.io/bigmoontech/project-nomad-wsl:${{ inputs.version }}
-            ghcr.io/bigmoontech/project-nomad-wsl:v${{ inputs.version }}
-            ${{ inputs.tag_latest && 'ghcr.io/bigmoontech/project-nomad-wsl:latest' || '' }}
-          build-args: |
-            VERSION=${{ inputs.version }}
-            BUILD_DATE=${{ github.event.workflow_run.created_at }}
-            VCS_REF=${{ github.sha }}
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      image: project-nomad-wsl
+      context: .
+      version: ${{ inputs.version }}
+      tag_latest: ${{ inputs.tag_latest }}
+    secrets:
+      CREATOR_PACKS_APP_KEY: ${{ secrets.CREATOR_PACKS_APP_KEY }}
+
+  translate:
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      image: project-nomad-wsl-translate
+      context: install/nomad-translate
+      version: ${{ inputs.version }}
+      tag_latest: ${{ inputs.tag_latest }}

@@ -1,4 +1,5 @@
 import {
+  CatalogLanguage,
   ListRemoteZimFilesResponse,
   RawRemoteZimFileEntry,
   RemoteZimFileEntry,
@@ -8,6 +9,7 @@ import * as cheerio from 'cheerio'
 import { XMLParser } from 'fast-xml-parser'
 import { isRawListRemoteZimFilesResponse, isRawRemoteZimFileEntry } from '../../util/zim.js'
 import { findReplacedWikipediaFiles } from '../utils/zim_filename.js'
+import { decideSupersededDeletion } from '../utils/superseded_resource.js'
 import logger from '@adonisjs/core/services/logger'
 import { DockerService } from './docker_service.js'
 import { inject } from '@adonisjs/core'
@@ -24,13 +26,22 @@ import vine from '@vinejs/vine'
 import { wikipediaOptionsFileSchema } from '#validators/curated_collections'
 import WikipediaSelection from '#models/wikipedia_selection'
 import InstalledResource from '#models/installed_resource'
+import CollectionManifest from '#models/collection_manifest'
 import { RunDownloadJob } from '#jobs/run_download_job'
+import { DownloadDrugDataJob } from '#jobs/download_drug_data_job'
+import { DrugReferenceService } from './drug_reference_service.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { CollectionManifestService } from './collection_manifest_service.js'
+import { KiwixCatalogService } from './kiwix_catalog_service.js'
 import { KiwixLibraryService } from './kiwix_library_service.js'
+import { RagService } from './rag_service.js'
+import { OllamaService } from './ollama_service.js'
 import type { CategoryWithStatus } from '../../types/collections.js'
 import CustomLibrarySource from '#models/custom_library_source'
 import { assertNotPrivateUrl } from '#validators/common'
+import { resolveZimDownload } from '../utils/zim_download_resolution.js'
+import { getHostedContentHeaders } from '../utils/hosted_content_auth.js'
+import { KIWIX_CATALOG_BASE_URL } from '../../constants/kiwix.js'
 
 const ZIM_MIME_TYPES = ['application/x-zim', 'application/x-openzim', 'application/octet-stream']
 const WIKIPEDIA_OPTIONS_URL = 'https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/collections/wikipedia.json'
@@ -69,12 +80,19 @@ export class ZimService {
     start,
     count,
     query,
+    language = 'eng',
   }: {
     start: number
     count: number
     query?: string
+    /**
+     * ISO-639-3 code to filter the catalog by, or `all` for no filter. Defaults to
+     * English, which is what this browser has always shown -- but it is now a default
+     * the user can change, not a hardcode. English is ~1,300 of the catalog's ~10,900
+     * books, so the filter was hiding the large majority of the library.
+     */
+    language?: string
   }): Promise<ListRemoteZimFilesResponse> {
-    const LIBRARY_BASE_URL = 'https://browse.library.kiwix.org/catalog/v2/entries'
     // Kiwix returns pages of content unaware of what the user has installed locally. When
     // the installed set is large, a single 12-item Kiwix page can come back with everything
     // already installed → 0 post-filter items → frontend deadlock (#731). Accumulate across
@@ -100,11 +118,12 @@ export class ZimService {
     let totalResults = 0
 
     for (let i = 0; i < MAX_KIWIX_FETCHES; i++) {
-      const res = await axios.get(LIBRARY_BASE_URL, {
+      const res = await axios.get(KIWIX_CATALOG_BASE_URL, {
         params: {
           start: currentStart,
           count: KIWIX_PAGE_SIZE,
-          lang: 'eng',
+          // `all` means "no filter", which the catalog expresses by omitting `lang`.
+          ...(language && language !== 'all' ? { lang: language } : {}),
           ...(query ? { q: query } : {}),
         },
         responseType: 'text',
@@ -162,6 +181,13 @@ export class ZimService {
           download_url,
           author: entry.author.name,
           file_name,
+          language: entry.language,
+          category: entry.category,
+          tags: entry.tags,
+          article_count: entry.articleCount,
+          media_count: entry.mediaCount,
+          publisher: entry.publisher?.name,
+          issued: entry['dc:issued'],
         })
       }
 
@@ -174,6 +200,62 @@ export class ZimService {
       has_more: currentStart < totalResults,
       total_count: totalResults,
       next_start: currentStart,
+    }
+  }
+
+  /**
+   * The languages the Kiwix catalog actually holds books in, newest count first.
+   *
+   * Sourced live from the catalog rather than a bundled ISO list, so the options are
+   * always exactly what can be browsed, and each carries a real book count. Titles are
+   * the catalog's own endonyms ("français", "中文"), which is what a reader scanning for
+   * their own language recognises.
+   *
+   * Requires internet, like the rest of this browser. Failures return an empty list
+   * rather than throwing: a missing language filter should degrade to "English only",
+   * never take down the page that lists the books.
+   */
+  async listCatalogLanguages(): Promise<CatalogLanguage[]> {
+    const LANGUAGES_URL = 'https://opds.library.kiwix.org/catalog/v2/languages'
+    try {
+      const res = await axios.get(LANGUAGES_URL, { responseType: 'text', timeout: 15000 })
+      const parser = new XMLParser({
+        ignoreAttributes: false,
+        attributeNamePrefix: '',
+        textNodeName: '#text',
+      })
+      const parsed = parser.parse(res.data)
+      const rawEntries = parsed?.feed?.entry
+        ? Array.isArray(parsed.feed.entry)
+          ? parsed.feed.entry
+          : [parsed.feed.entry]
+        : []
+
+      const languages: CatalogLanguage[] = []
+      for (const raw of rawEntries) {
+        if (!raw || typeof raw !== 'object') continue
+        // `dc:language` is the ISO-639-3 code; `thr:count` is how many books carry it.
+        const code = raw['dc:language']
+        const label = raw.title
+        const bookCount = Number(raw['thr:count'])
+        if (typeof code !== 'string' || !code.trim()) continue
+        if (!Number.isFinite(bookCount) || bookCount <= 0) continue
+        languages.push({
+          code: code.trim(),
+          label: typeof label === 'string' && label.trim() ? label.trim() : code.trim(),
+          book_count: bookCount,
+        })
+      }
+
+      languages.sort((a, b) => b.book_count - a.book_count)
+      return languages
+    } catch (error) {
+      logger.warn(
+        `[ZimService] Catalog language list unavailable: ${
+          error instanceof Error ? error.message : error
+        }`
+      )
+      return []
     }
   }
 
@@ -208,7 +290,6 @@ export class ZimService {
       filepath,
       timeout: 30000,
       allowedMimeTypes: ZIM_MIME_TYPES,
-      forceNew: true,
       filetype: 'zim',
       title: metadata?.title,
       totalBytes: metadata?.size_bytes,
@@ -251,40 +332,100 @@ export class ZimService {
 
     const allResources = CollectionManifestService.resolveTierResources(tier, category.tiers)
 
-    // Filter out already installed
-    const installed = await InstalledResource.query().where('resource_type', 'zim')
+    // Filter out already installed. Includes 'dataset' rows (the FDA drug labels)
+    // alongside 'zim' so an installed dataset is filtered out here — without it,
+    // a re-select of an installed Medicine tier would re-dispatch the ~1.7 GB drug
+    // download every time (the dataset branch's own getIngestStatus guard is a
+    // second line of defence, but this keeps the filter symmetric with the row-
+    // driven tier-status math).
+    const installed = await InstalledResource.query().whereIn('resource_type', ['zim', 'dataset'])
     const installedIds = new Set(installed.map((r) => r.resource_id))
     const toDownload = allResources.filter((r) => !installedIds.has(r.id))
 
     if (toDownload.length === 0) return null
 
+    const latestByResource = await new KiwixCatalogService().getLatestForResources(
+      toDownload.map((resource) => ({ resource_id: resource.id, resource_type: 'zim' }))
+    )
     const downloadFilenames: string[] = []
 
     for (const resource of toDownload) {
-      const existingJob = await RunDownloadJob.getActiveByUrl(resource.url)
-      if (existingJob) {
-        logger.warn(`[ZimService] Download already in progress for ${resource.url}, skipping.`)
+      // A `dataset` resource (e.g. the FDA drug labels) is DB-ingested, not a
+      // ZIM file — route it to the drug download+ingest pipeline instead of
+      // RunDownloadJob. The install-state row written on ingest 'ready' (below,
+      // via resourceMeta) is what the installed-filter above and the tier-status
+      // math key off; until that row exists the getIngestStatus guard prevents
+      // re-dispatching the ~1.7 GB download on every tier select.
+      if (resource.type === 'dataset') {
+        const drugReferenceService = new DrugReferenceService()
+        const status = await drugReferenceService.getIngestStatus()
+        if (status.phase === 'ready' || status.rowCount > 0) {
+          logger.info('[ZimService] Drug dataset already ingested, skipping dispatch.')
+          // Reaching here means no 'dataset' row exists (the installed filter
+          // above would have dropped the resource). A finished ingest that lost
+          // its row write (1.34.0's narrow enum, or a manual ingest) gets one now,
+          // so re-selecting the tier resolves it without waiting for a reboot.
+          if (status.phase === 'ready' && status.lastUpdated) {
+            try {
+              await drugReferenceService.recordInstalledRow({
+                version: status.lastUpdated,
+                collectionRef: categorySlug,
+                fileSizeBytes: null,
+              })
+              logger.info('[ZimService] Backfilled installed_resources row for the drug dataset.')
+            } catch (err) {
+              logger.error(
+                `[ZimService] Failed to backfill drug dataset row: ${
+                  err instanceof Error ? err.message : String(err)
+                }`
+              )
+            }
+          }
+          continue
+        }
+        // DownloadDrugDataJob.dispatch() is idempotent on its deterministic
+        // jobId — a concurrent in-flight download returns "already running"
+        // without re-adding, so this is safe to call repeatedly. The resourceMeta
+        // is threaded through download → ingest so the final ingest pass writes
+        // the `installed_resources` 'dataset' row, making the tier read installed.
+        await DownloadDrugDataJob.dispatch(true, {
+          resourceId: resource.id,
+          version: resource.version,
+          collectionRef: categorySlug,
+        })
+        logger.info('[ZimService] Dispatched drug data download for dataset resource.')
         continue
       }
 
-      const filename = resource.url.split('/').pop()
+      const resolved = resolveZimDownload(
+        resource,
+        latestByResource.get(`zim:${resource.id}`) ?? null
+      )
+      const existingJob = await RunDownloadJob.getActiveByUrl(resolved.url)
+      if (existingJob) {
+        logger.warn(`[ZimService] Download already in progress for ${resolved.url}, skipping.`)
+        continue
+      }
+
+      const filename = resolved.url.split('/').pop()
       if (!filename) continue
 
       downloadFilenames.push(filename)
       const filepath = join(process.cwd(), ZIM_STORAGE_PATH, filename)
 
       await RunDownloadJob.dispatch({
-        url: resource.url,
+        url: resolved.url,
         filepath,
         timeout: 30000,
         allowedMimeTypes: ZIM_MIME_TYPES,
-        forceNew: true,
         filetype: 'zim',
         title: (resource as any).title || undefined,
-        totalBytes: (resource as any).size_mb ? (resource as any).size_mb * 1024 * 1024 : undefined,
+        totalBytes: resolved.sizeBytes,
+        // Undefined for every ungated resource, so the existing flow is untouched.
+        requestHeaders: getHostedContentHeaders(resource),
         resourceMetadata: {
           resource_id: resource.id,
-          version: resource.version,
+          version: resolved.version,
           collection_ref: categorySlug,
         },
       })
@@ -358,6 +499,8 @@ export class ZimService {
     }
 
     // Create InstalledResource entries for downloaded files
+    const zimStorageDir = join(process.cwd(), ZIM_STORAGE_PATH)
+    let removedSupersededZim = false
     for (const url of urls) {
       // Skip Wikipedia files (managed separately)
       if (url.includes('wikipedia_en_')) continue
@@ -368,10 +511,17 @@ export class ZimService {
       const parsed = CollectionManifestService.parseZimFilename(filename)
       if (!parsed) continue
 
-      const filepath = join(process.cwd(), ZIM_STORAGE_PATH, filename)
+      const filepath = join(zimStorageDir, filename)
       const stats = await getFileStatsIfExists(filepath)
 
       try {
+        // Capture the prior install for this resource_id BEFORE updateOrCreate
+        // overwrites it, so we know the old file path to clean up (#634).
+        const prior = await InstalledResource.query()
+          .where('resource_id', parsed.resource_id)
+          .where('resource_type', 'zim')
+          .first()
+
         const { DateTime } = await import('luxon')
         await InstalledResource.updateOrCreate(
           { resource_id: parsed.resource_id, resource_type: 'zim' },
@@ -384,10 +534,196 @@ export class ZimService {
           }
         )
         logger.info(`[ZimService] Created InstalledResource entry for: ${parsed.resource_id}`)
+
+        // Remove the superseded prior version's file if (and only if) every
+        // safety rail passes — see decideSupersededDeletion. The InstalledResource
+        // row already points at the new file, so we delete the old file directly
+        // (NOT via this.delete(), which would drop the row by resource_id).
+        const decision = decideSupersededDeletion({
+          existing: prior ? { file_path: prior.file_path, version: prior.version } : null,
+          newFilePath: filepath,
+          newVersion: parsed.version,
+          newFileExists: !!stats,
+          storageBaseDir: zimStorageDir,
+        })
+        if (decision.delete && decision.path) {
+          try {
+            await deleteFileIfExists(decision.path)
+            removedSupersededZim = true
+            logger.info(
+              `[ZimService] Removed superseded ${parsed.resource_id} file: ${decision.path}`
+            )
+          } catch (err) {
+            logger.warn(`[ZimService] Failed to remove superseded file ${decision.path}:`, err)
+          }
+        } else if (decision.reason !== 'first_install' && decision.reason !== 'same_file') {
+          logger.info(
+            `[ZimService] Kept prior ${parsed.resource_id} file (reason: ${decision.reason})`
+          )
+        }
       } catch (error) {
         logger.error(`[ZimService] Failed to create InstalledResource for ${filename}:`, error)
       }
     }
+
+    // If we removed any superseded ZIM, rebuild the Kiwix library so its XML no
+    // longer references the deleted file. The earlier rebuild in this flow ran
+    // while both versions were still on disk.
+    if (removedSupersededZim) {
+      try {
+        await new KiwixLibraryService().rebuildFromDisk()
+        logger.info('[ZimService] Rebuilt Kiwix library after removing superseded ZIM(s).')
+      } catch (err) {
+        logger.error('[ZimService] Failed to rebuild Kiwix library after cleanup:', err)
+      }
+    }
+  }
+
+  /**
+   * Rebuilds the kiwix library XML from whatever ZIM files are currently on disk.
+   *
+   * This is the manual counterpart to the automatic rebuilds that run after a
+   * download or delete. It exists for the sideload case: a user copies a .zim file
+   * onto the box (USB, SSH, network share) outside the download flow, and kiwix has
+   * no way to discover it without regenerating the library index.
+   *
+   * In library mode (--monitorLibrary) kiwix-serve hot-reloads the XML on its own, so
+   * no restart is needed. Only legacy glob-mode containers are restarted to pick up
+   * the change. Returns the book count before and after plus the number added.
+   */
+  async rescanLibrary(): Promise<{ before: number; after: number; added: number }> {
+    const kiwixLibraryService = new KiwixLibraryService()
+    const before = await kiwixLibraryService.getBookCount()
+    const after = await kiwixLibraryService.rebuildFromDisk()
+
+    const isLegacy = await this.dockerService.isKiwixOnLegacyConfig()
+    if (isLegacy) {
+      logger.info('[ZimService] Kiwix in legacy mode — restarting container after rescan.')
+      await this.dockerService
+        .affectContainer(SERVICE_NAMES.KIWIX, 'restart')
+        .catch((error) => {
+          logger.error('[ZimService] Failed to restart KIWIX container after rescan:', error)
+        })
+    }
+
+    return { before, after, added: Math.max(0, after - before) }
+  }
+
+  async registerLocalUpload(filename: string): Promise<{ added: number }> {
+    let added = 0
+    try {
+      const result = await this.rescanLibrary()
+      added = result.added
+    } catch (err) {
+      logger.error('[ZimService] Failed to rebuild kiwix library after local upload:', err)
+    }
+
+    const parsed = CollectionManifestService.parseZimFilename(filename)
+    if (parsed) {
+      const filepath = join(process.cwd(), ZIM_STORAGE_PATH, filename)
+      const stats = await getFileStatsIfExists(filepath)
+      try {
+        const { DateTime } = await import('luxon')
+        await InstalledResource.updateOrCreate(
+          { resource_id: parsed.resource_id, resource_type: 'zim' },
+          {
+            version: parsed.version,
+            url: `local-upload://${filename}`,
+            file_path: filepath,
+            file_size_bytes: stats ? Number(stats.size) : null,
+            installed_at: DateTime.now(),
+          }
+        )
+      } catch (error) {
+        logger.error(`[ZimService] Failed to create InstalledResource for ${filename}:`, error)
+      }
+    }
+
+    // If the uploaded file matches a known Wikipedia option, mark it as installed
+    try {
+      const manifest = await CollectionManifest.find('wikipedia')
+      if (manifest) {
+        const spec = manifest.spec_data as { options: Array<{ id: string; url: string | null }> }
+        const matchedOption = spec.options.find(
+          (opt) => opt.url && opt.url.split('/').pop() === filename
+        )
+        if (matchedOption && matchedOption.url) {
+          const existing = await WikipediaSelection.query().first()
+          if (existing) {
+            existing.option_id = matchedOption.id
+            existing.url = matchedOption.url
+            existing.filename = filename
+            existing.status = 'installed'
+            await existing.save()
+          } else {
+            await WikipediaSelection.create({
+              option_id: matchedOption.id,
+              url: matchedOption.url,
+              filename,
+              status: 'installed',
+            })
+          }
+          logger.info(`[ZimService] Marked Wikipedia option '${matchedOption.id}' as installed from local upload`)
+
+          // Remove any other wikipedia_en_*.zim files, same as the download flow
+          const allFiles = await this.list()
+          const staleWikipediaFiles = allFiles.files.filter(
+            (f) => f.name.startsWith('wikipedia_en_') && f.name !== filename
+          )
+          for (const stale of staleWikipediaFiles) {
+            try {
+              await this.delete(stale.name)
+              logger.info(`[ZimService] Deleted stale Wikipedia file after upload: ${stale.name}`)
+            } catch (err) {
+              logger.warn(`[ZimService] Could not delete stale Wikipedia file: ${stale.name}`, err)
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger.error(`[ZimService] Failed to update WikipediaSelection for ${filename}:`, error)
+    }
+
+    const ollamaUrl = await this.dockerService.getServiceURL('nomad_ollama')
+    if (ollamaUrl) {
+      // Respect the global ingest policy, same as the post-download path (PR #919).
+      // This used to dispatch unconditionally, so a user who deliberately chose
+      // Manual still got sideloaded ZIMs embedded behind their back.
+      //
+      // Reuses decideScanAction rather than re-inlining the Always/Manual check,
+      // so an existing browse_only or pending_decision row is honored too instead
+      // of being overridden by the act of re-uploading the file.
+      const filePath = join(process.cwd(), ZIM_STORAGE_PATH, filename)
+      try {
+        const { default: KVStore } = await import('#models/kv_store')
+        const { default: KbIngestState } = await import('#models/kb_ingest_state')
+        const { decideScanAction } = await import('../utils/kb_ingest_decision.js')
+
+        // Unset is treated as Always, preserving legacy behavior — mirrors
+        // rag_service.ts and run_download_job.ts.
+        const policyRaw = await KVStore.getValue('rag.defaultIngestPolicy')
+        const policy = policyRaw === 'Manual' ? 'Manual' : 'Always'
+
+        const existing = await KbIngestState.findBy('file_path', filePath)
+        const action = decideScanAction(existing, false, policy)
+
+        if (action.kind === 'dispatch') {
+          const { EmbedFileJob } = await import('#jobs/embed_file_job')
+          await EmbedFileJob.dispatch({ fileName: filename, filePath })
+        } else if (action.kind === 'create_pending') {
+          // firstOrCreate so the KB panel surfaces the per-file Index affordance
+          // without demoting a row that already exists.
+          await KbIngestState.getOrCreate(filePath)
+        }
+        // 'skip' and 'backfill_indexed' need no action here: the file was just
+        // written to disk, so there is nothing to backfill and a settled state
+        // row means the user has already decided about this file.
+      } catch (error) {
+        logger.error(`[ZimService] KB ingest decision failed after local upload:`, error)
+      }
+    }
+
+    return { added }
   }
 
   async delete(file: string): Promise<void> {
@@ -411,6 +747,25 @@ export class ZimService {
 
     await deleteFileIfExists(fullPath)
 
+    // Purge this file's Qdrant points and KbIngestState row directly so a
+    // deleted ZIM stops surfacing as a stale search citation immediately,
+    // rather than waiting for the next scanAndSyncStorage reverse sweep to
+    // catch it (#1170). Never touched Qdrant here before — the file's points
+    // and state row would otherwise linger indefinitely.
+    //
+    // Guarded on the AI Assistant being installed at all — otherwise every
+    // delete on an install without it hits _initializeQdrantClient()'s
+    // "offline" throw and logs a misleading error for the common no-AI case.
+    const qdrantInstalled = !!(await this.dockerService.getServiceURL(SERVICE_NAMES.QDRANT))
+    if (qdrantInstalled) {
+      try {
+        const ragService = new RagService(this.dockerService, new OllamaService())
+        await ragService.purgeIndexedSource(fullPath)
+      } catch (err) {
+        logger.error(`[ZimService] Failed to purge knowledge-base entries for ${fullPath}:`, err)
+      }
+    }
+
     // Remove from kiwix library XML so --monitorLibrary stops serving the deleted file
     const kiwixLibraryService = new KiwixLibraryService()
     await kiwixLibraryService.removeBook(fileName).catch((err) => {
@@ -425,6 +780,21 @@ export class ZimService {
         .where('resource_type', 'zim')
         .delete()
       logger.info(`[ZimService] Deleted InstalledResource entry for: ${parsed.resource_id}`)
+    }
+
+    // If this file was the active Wikipedia selection, clear the selection
+    try {
+      const selection = await WikipediaSelection.query().first()
+      if (selection && selection.filename === fileName) {
+        selection.option_id = 'none'
+        selection.status = 'none'
+        selection.filename = null
+        selection.url = null
+        await selection.save()
+        logger.info(`[ZimService] Cleared WikipediaSelection after deleting ${fileName}`)
+      }
+    } catch (error) {
+      logger.error(`[ZimService] Failed to clear WikipediaSelection after deleting ${fileName}:`, error)
     }
   }
 
@@ -565,7 +935,6 @@ export class ZimService {
       filepath,
       timeout: 30000,
       allowedMimeTypes: ZIM_MIME_TYPES,
-      forceNew: true,
       filetype: 'zim',
       title: selectedOption.name,
       totalBytes: selectedOption.size_mb ? selectedOption.size_mb * 1024 * 1024 : undefined,

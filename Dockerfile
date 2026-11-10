@@ -1,32 +1,64 @@
-FROM node:22-slim AS base
+FROM node:24-bookworm-slim AS base
 
 # Install bash & curl for entrypoint script compatibility, graphicsmagick for pdf2pic, and vips-dev & build-base for sharp 
 RUN apt-get update && apt-get install -y \
       bash \
       curl \
+      openssl \
       graphicsmagick \
       libvips-dev \
       build-essential \
       pciutils \
       && rm -rf /var/lib/apt/lists/*
 
+# @openzim/libzim 4.0.0 needs the matching 9.4.0 headers and shared library.
+# Resume interrupted downloads and verify the archive before npm builds the binding.
+FROM base AS libzim
+ARG TARGETARCH
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) arch=x86_64; digest=4a755fcdbfb17f3421b5adf3b5e23c50c7e3f7ae05fa38df71f2d0c44f8feed3 ;; \
+      arm64) arch=aarch64-manylinux; digest=28eaf5a52e6d800c0ca9e215b8ad63e0805a4c98768f9a4134a38ff311b79400 ;; \
+      *) exit 1 ;; \
+    esac; \
+    mkdir /archives; cd /archives; file="libzim_linux-${arch}-9.4.0.tar.gz"; \
+    for attempt in 1 2 3 4 5; do \
+      curl -fSL --connect-timeout 15 --speed-limit 512 --speed-time 30 -C - -o "$file" \
+        "https://download.openzim.org/release/libzim/$file" && break; \
+    done; \
+    echo "$digest  $file" | sha256sum -c -
+
 # All deps stage
 FROM base AS deps
 WORKDIR /app
 ADD admin/package.json admin/package-lock.json ./
-RUN npm ci
+# The package installer skips its network fetch when the archive already exists.
+# Use the base image’s matching Node headers for concurrent native addon builds.
+RUN --mount=type=bind,from=libzim,source=/archives,target=/archives \
+    npm ci --ignore-scripts \
+    && dest=node_modules/@openzim/libzim/download \
+    && mkdir -p "$dest" \
+    && cp /archives/*.tar.gz "$dest/" \
+    && tar -xzf /archives/*.tar.gz --strip-components=1 -C "$dest" \
+    && npm_config_nodedir=/usr/local npm rebuild \
+    && rm "$dest"/*.tar.gz
 
-# Production only deps stage
-FROM base AS production-deps
-WORKDIR /app
-ADD admin/package.json admin/package-lock.json ./
-RUN npm ci --omit=dev
+FROM deps AS production-deps
+RUN npm prune --omit=dev --ignore-scripts
 
 # Build stage
 FROM base AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules /app/node_modules
 ADD admin/ ./
+# Regenerate the curated drug-reference data modules
+# (app/data/{conditions,natural_remedies,home_remedies}.ts) from their single
+# source of truth — the repo-root collections/*.json — so the JSON is what gets
+# compiled into the image and the committed .ts can never silently drift from it
+# in a build. The gen script resolves ../../collections relative to admin/scripts,
+# which is /collections once admin/ has been copied to /app.
+COPY collections/ /collections/
+RUN npm run gen:curated-data
 RUN node ace build
 
 # Production stage
@@ -61,8 +93,8 @@ RUN set -eux; \
     /usr/local/bin/pmtiles version
 
 # Labels
-LABEL org.opencontainers.image.title="Project N.O.M.A.D (WSL2 fork)" \
-      org.opencontainers.image.description="Project N.O.M.A.D Docker image with Windows/WSL2 + Docker Desktop support. Fork of Crosstalk Solutions' Project N.O.M.A.D." \
+LABEL org.opencontainers.image.title="Project NOMAD (BigMoonTech fork)" \
+      org.opencontainers.image.description="Project NOMAD for Windows/WSL2 and native ARM64 Linux. Fork of Crosstalk Solutions' Project N.O.M.A.D." \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${VCS_REF}" \
@@ -74,6 +106,17 @@ LABEL org.opencontainers.image.title="Project N.O.M.A.D (WSL2 fork)" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 ENV NODE_ENV=production
+
+# Creator Packs entitlement key, injected into OFFICIAL release builds at build
+# time (--build-arg CREATOR_PACKS_APP_KEY=... from the CREATOR_PACKS_APP_KEY CI
+# secret; see build-primary-image.yml). Baked as an ENV so admin/start/env.ts
+# reads it at runtime. Empty by default, so builds from source (and any build
+# without the secret) ship UNCONFIGURED and hide the Creator Packs UI. The key
+# lands in this public image layer (extractable — the accepted ceiling); rotate
+# via `wrangler secret put APP_KEY` + a new image if it leaks.
+ARG CREATOR_PACKS_APP_KEY=""
+ENV CREATOR_PACKS_APP_KEY=$CREATOR_PACKS_APP_KEY
+
 WORKDIR /app
 COPY --from=production-deps /app/node_modules /app/node_modules
 COPY --from=build /app/build /app
@@ -85,6 +128,10 @@ RUN echo "{\"version\":\"${VERSION}\"}" > /app/version.json
 # Copy docs and README for access within the container
 COPY admin/docs /app/docs
 COPY README.md /app/README.md
+
+# Empty Calibre library, seeded into storage/books on Calibre-Web install
+# (see DockerService._runPreinstallActions__CalibreWeb)
+COPY install/calibre-empty-library/metadata.db /app/assets/calibre/metadata.db
 
 # Copy entrypoint script and ensure it's executable
 COPY install/entrypoint.sh /usr/local/bin/entrypoint.sh

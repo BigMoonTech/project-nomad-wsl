@@ -1,4 +1,4 @@
-# BigMoonTech Project N.O.M.A.D. WSL2 Fork — Maintainer Playbook
+# BigMoonTech Project N.O.M.A.D. WSL2 and ARM64 Fork — Maintainer Playbook
 
 This is the operations guide for maintaining the fork: how it's wired together, how to release new versions, how to pull in upstream changes, and how to troubleshoot when things go sideways.
 
@@ -12,13 +12,14 @@ This is the operations guide for maintaining the fork: how it's wired together, 
 - **License:** Apache 2.0 (inherited from upstream — must keep)
 
 ### Container Registry (GHCR — GitHub Container Registry)
-All Docker images are published under `ghcr.io/bigmoontech/`:
+Each release image uses one tag for native `linux/amd64` and `linux/arm64` builds. The images are published under `ghcr.io/bigmoontech/`:
 - `ghcr.io/bigmoontech/project-nomad-wsl` — the main admin/Command Center image
+- `ghcr.io/bigmoontech/project-nomad-wsl-translate` — optional offline translation service, built by the primary workflow
 - `ghcr.io/bigmoontech/project-nomad-wsl-sidecar-updater` — the updater sidecar (handles in-app updates)
 - `ghcr.io/bigmoontech/project-nomad-wsl-disk-collector` — the disk info collector sidecar
 
 ### Deployed Install
-- **Path on WSL2:** `/opt/project-nomad/`
+- **Path on WSL2 and native Linux:** `/opt/project-nomad/`
 - **Compose file:** `/opt/project-nomad/compose.yml` (downloaded from your fork at install time)
 - **Helper scripts:** `/opt/project-nomad/start_nomad.sh`, `stop_nomad.sh`, `update_nomad.sh`
 - **Storage:** `/opt/project-nomad/storage/` (ZIM files, uploads, logs)
@@ -59,6 +60,7 @@ These point at upstream so the fork inherits content updates automatically. Fork
 5. **Validate Collection URLs** (`validate-collection-urls.yml`) — automatic on push to collections/
 
 ### Removed Workflows
+- `build-translate-proxy.yml` — the fork builds Translated Library from the primary workflow on both architectures.
 - ~~`release.yml`~~ — Upstream's semantic-release automation. Required Crosstalk's `COSMISTACKBOT_ACCESS_TOKEN` and bot identity. Removed; we cut releases manually instead.
 
 ---
@@ -127,11 +129,11 @@ chore(ci): tweak workflow
 docs: update README
 ```
 
-Push to `main` via GitHub Desktop.
+Merge the tested changes into the fork’s `main`. Both platforms ship from that commit.
 
 ### Step 2: Pick the new version number
 - Look at the previous release tag on https://github.com/BigMoonTech/project-nomad-wsl/releases
-- Bump appropriately (PATCH/MINOR/MAJOR per semver)
+- Apply the fork numbering rule in Part 2. Upstream 1.35.1 maps to fork 1.35.100.
 
 ### Step 3: Build all three Docker images
 **Go to:** https://github.com/BigMoonTech/project-nomad-wsl/actions
@@ -149,15 +151,29 @@ For each:
 - **Tag latest:** ✅ check this (unless it's a pre-release/RC)
 - Click **Run workflow**
 
-Wait for all three to go ✅ green. Each takes 3–5 minutes. They run in parallel.
+Wait for all publish jobs in the three workflows, including Translate in the primary workflow. Both platform builds must succeed for that image’s tags to move.
 
 ### Step 4: Verify images published
-Check these three URLs and confirm your new version appears:
-- https://github.com/BigMoonTech/project-nomad-wsl/pkgs/container/project-nomad-wsl
-- https://github.com/BigMoonTech/project-nomad-wsl/pkgs/container/project-nomad-wsl-sidecar-updater
-- https://github.com/BigMoonTech/project-nomad-wsl/pkgs/container/project-nomad-wsl-disk-collector
 
-Each should list your new version tag plus `latest` pointing to it.
+Check that all three runs succeeded on the same commit. For a stable release, verify that each alias resolves to the same manifest and both Linux architectures are present. Set `version` to the value supplied to the three workflows.
+
+```bash
+set -e
+version=1.35.100
+for suffix in '' -sidecar-updater -disk-collector -translate; do
+  image="ghcr.io/bigmoontech/project-nomad-wsl${suffix}"
+  digest=$(docker buildx imagetools inspect "$image:$version" --format '{{.Manifest.Digest}}')
+  for alias in "v$version" latest; do
+    test "$(docker buildx imagetools inspect "$image:$alias" --format '{{.Manifest.Digest}}')" = "$digest"
+  done
+  docker buildx imagetools inspect "$image:$version" --raw | jq -e '
+    [.manifests[].platform | select(.os == "linux") | .architecture] | unique == ["amd64","arm64"]'
+done
+```
+
+On the first publication of the Translate package, set its visibility to **Public** in the GitHub package settings. Check all four image tags from a signed-out Docker client before publishing the GitHub Release.
+
+For a prerelease, leave `tag_latest` off and verify only the versioned aliases.
 
 ### Step 5: Create the GitHub Release (THIS IS WHAT FLIPS THE UPDATE SWITCH)
 
@@ -173,7 +189,7 @@ Each should list your new version tag plus `latest` pointing to it.
 | Field | What to enter |
 |-------|---------------|
 | **Choose a tag** | Type the version with `v` prefix (e.g., `v1.32.1`). You'll see a "Create new tag: v1.32.1 on publish" option appear — click it. |
-| **Target** | Leave as `main` (default) |
+| **Target** | Select the exact commit built by the three workflows. |
 | **Previous tag** | Leave as `auto` (default) — GitHub picks the previous release |
 | **Release title** | `v1.32.1` (or `v1.32.1 — <short summary>` if you want) |
 | **Describe this release** | Use the template below |
@@ -204,6 +220,26 @@ Existing installs: open the admin panel → Settings → Check for Updates.
 ```
 
 **Click `Publish release`.**
+
+### Release text for v1.35.100
+
+**Title** — `v1.35.100 — Upstream 1.35.1 and native ARM64 support`
+
+**Previous tag** — `v1.32.101`
+
+```markdown
+This release brings the Windows/WSL2 fork up to upstream 1.35.1, including the subsequent Military Medicine catalog correction. Windows keeps its Docker Desktop integration and WSL storage reporting. Scheduled and manual Command Center updates use the BigMoonTech release feed.
+
+DGX Spark and other 64-bit ARM Debian/Ubuntu hosts can run the same release with native Docker Engine. Docker selects the matching Command Center, updater and disk collector images. Excalidraw and offline Translated Library are available on both architectures.
+
+Existing users can open Settings → Check for Updates. For a new installation, follow the Windows or native Linux instructions in the README.
+```
+
+The v1.32.101 in-app updater recreates the admin service and leaves its own container and the disk collector running. To pick up the new helper images as well, run this once in the Linux or WSL2 terminal after the in-app update (standard installation):
+
+```bash
+sudo docker compose -p project-nomad -f /opt/project-nomad/compose.yml up -d --no-deps --pull always updater disk-collector
+```
 
 ### Step 6: Verify the release is queryable
 From any terminal (or browser):

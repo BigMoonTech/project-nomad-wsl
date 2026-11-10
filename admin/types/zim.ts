@@ -19,6 +19,19 @@ export type ListRemoteZimFilesResponse = {
   next_start: number
 }
 
+/** One selectable language in the Kiwix catalog, with how many books it holds. */
+export type CatalogLanguage = {
+  /** ISO-639-3 code as the catalog uses it, e.g. `eng`, `fra`, `zho`. */
+  code: string
+  /** The catalog's own label, which is the endonym: "français", "中文". */
+  label: string
+  book_count: number
+}
+
+export type ListCatalogLanguagesResponse = {
+  languages: CatalogLanguage[]
+}
+
 export type RawRemoteZimFileEntry = {
   'id': string
   'title': string
@@ -64,6 +77,13 @@ export type RemoteZimFileEntry = {
   download_url: string
   author: string
   file_name: string
+  language?: string
+  category?: string
+  tags?: string
+  article_count?: number
+  media_count?: number
+  publisher?: string
+  issued?: string
 }
 
 export type ExtractZIMContentOptions = {
@@ -71,8 +91,8 @@ export type ExtractZIMContentOptions = {
   maxArticles?: number
   onProgress?: (processedArticles: number, totalArticles: number) => void
   // Batch processing options to avoid lock timeouts
-  startOffset?: number  // Article index to start from for resuming
-  batchSize?: number    // Max articles to process in this batch
+  startOffset?: number // Article index to start from for resuming
+  batchSize?: number // Max articles to process in this batch
 }
 
 export type ExtractZIMChunkingStrategy = 'structured' | 'simple'

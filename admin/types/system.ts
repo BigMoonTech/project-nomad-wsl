@@ -6,6 +6,18 @@ export type GpuHealthStatus = {
   hasRocmRuntime: boolean
   ollamaGpuAccessible: boolean
   gpuVendor?: 'nvidia' | 'amd'
+  /**
+   * AMD passthrough_failed only. Whether a reinstall would change the running
+   * container. When false, a reinstall rebuilds the same CPU-bound container and
+   * the fix is an HSA override (ai.amdHsaOverride).
+   */
+  amdReinstallWouldChange?: boolean
+  /** gfx target Ollama reported for an unsupported AMD GPU, e.g. 'gfx1103'. */
+  amdGfxTarget?: string
+  /** HSA_OVERRIDE_GFX_VERSION the running container has, if any. */
+  currentHsaOverride?: string
+  /** Override the gfx mapping recommends for amdGfxTarget, if it knows one. */
+  suggestedHsaOverride?: string
 }
 
 export type SystemInformationResponse = {
@@ -85,4 +97,79 @@ export type CheckLatestVersionResult = {
   currentVersion: string,
   latestVersion: string,
   message?: string
+}
+
+export type AutoUpdateEligibleTarget = {
+  version: string
+  tag: string
+  publishedAt: string
+}
+
+export type AutoUpdateStatus = {
+  enabled: boolean
+  windowStart: string
+  windowEnd: string
+  cooloffHours: number
+  currentVersion: string
+  withinWindow: boolean
+  eligibleTarget: AutoUpdateEligibleTarget | null
+  lastAttemptAt: string | null
+  lastResult: string | null
+  lastError: string | null
+  consecutiveFailures: number
+  autoDisabledReason: string | null
+}
+
+export type AppAutoUpdateAppStatus = {
+  service_name: string
+  friendly_name: string | null
+  auto_update_enabled: boolean
+  current_version: string
+  available_update_version: string | null
+  first_seen_at: string | null
+  eligible: boolean
+  reason: string
+  cooloff_remaining_hours: number | null
+  consecutive_failures: number
+  auto_disabled_reason: string | null
+}
+
+export type AppAutoUpdateStatus = {
+  enabled: boolean
+  windowStart: string
+  windowEnd: string
+  cooloffHours: number
+  withinWindow: boolean
+  lastAttemptAt: string | null
+  lastResult: string | null
+  apps: AppAutoUpdateAppStatus[]
+}
+
+export type ContentAutoUpdateResourceStatus = {
+  resource_id: string
+  resource_type: 'zim' | 'map'
+  current_version: string
+  available_update_version: string | null
+  size_bytes: number | null
+  eligible: boolean
+  reason: string
+  cooloff_remaining_hours: number | null
+  exceeds_cap: boolean
+  consecutive_failures: number
+  auto_disabled_reason: string | null
+}
+
+export type ContentAutoUpdateStatus = {
+  enabled: boolean
+  windowStart: string
+  windowEnd: string
+  cooloffHours: number
+  maxBytesPerWindow: number
+  withinWindow: boolean
+  windowBytesUsed: number
+  lastAttemptAt: string | null
+  lastResult: string | null
+  lastError: string | null
+  autoDisabledReason: string | null
+  resources: ContentAutoUpdateResourceStatus[]
 }

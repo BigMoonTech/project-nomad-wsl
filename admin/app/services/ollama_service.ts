@@ -2,7 +2,11 @@ import { inject } from '@adonisjs/core'
 import OpenAI from 'openai'
 import type { ChatCompletionChunk, ChatCompletionMessageParam } from 'openai/resources/chat/completions.js'
 import type { Stream } from 'openai/streaming.js'
-import { NomadOllamaModel } from '../../types/ollama.js'
+import { Ollama } from 'ollama'
+import { ThinkTagSplitter, normalizeNonStreamed } from '../utils/think_stream.js'
+import { readContextLength, readModelfileNumCtx } from '../utils/context_window.js'
+import { compatSamplerParams, nativeSamplerOptions, readModelfileSamplers } from '../utils/sampler.js'
+import { NomadOllamaModel, SamplerProfile } from '../../types/ollama.js'
 import { EMBEDDING_MODEL_NAME, FALLBACK_RECOMMENDED_OLLAMA_MODELS } from '../../constants/ollama.js'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -16,44 +20,205 @@ import { BROADCAST_CHANNELS } from '../../constants/broadcast.js'
 import env from '#start/env'
 import { NOMAD_API_DEFAULT_BASE_URL } from '../../constants/misc.js'
 import KVStore from '#models/kv_store'
+import type { ModelCapabilities } from '../utils/model_capabilities.js'
+import {
+  installedModelsFromOpenAIResponse,
+  resolveModelCapabilities,
+} from '../utils/model_capabilities.js'
 
 const NOMAD_MODELS_API_PATH = '/api/v1/ollama/models'
 const MODELS_CACHE_FILE = path.join(process.cwd(), 'storage', 'ollama-models-cache.json')
 const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000 // 24 hours
+
+/** Ollama reports durations in nanoseconds. */
+function nsToMs(ns: number | undefined): number | undefined {
+  return typeof ns === 'number' ? ns / 1e6 : undefined
+}
+
+/**
+ * What `/api/show` tells us about a model. All fields are optional because
+ * non-Ollama backends don't expose the endpoint at all, and because Ollama's
+ * `model_info` keys are architecture-prefixed and not guaranteed present.
+ */
+export type NomadModelInfo = {
+  hasThinking: boolean
+  /** Trained context length, e.g. `llama.context_length`. The hard ceiling for num_ctx. */
+  contextLength?: number
+  /** e.g. "8.0B" — the honest source for model size, vs. guessing from the tag name. */
+  parameterSize?: string
+  quantizationLevel?: string
+  /** num_ctx baked into the modelfile, if the author set one. */
+  modelfileNumCtx?: number
+  /**
+   * Sampler values baked into the modelfile, if the author set any. Under the
+   * `auto` response style these beat NOMAD's own preset key by key, so a model
+   * tuned by its author keeps its tuning and only gains the settings it lacked.
+   */
+  modelfileSamplers?: SamplerProfile
+  /**
+   * The raw `model_info` blob. Carries the GGUF architecture keys
+   * (block_count, attention.head_count_kv, embedding_length) that make an exact
+   * KV-cache cost calculation possible. Kept whole rather than picked apart here
+   * because the key names are architecture-prefixed and vary by family.
+   */
+  rawModelInfo?: Record<string, any>
+}
 
 export type NomadInstalledModel = {
   name: string
   size: number
   digest?: string
   details?: Record<string, any>
+  capabilities?: string[]
+}
+
+/**
+ * Token accounting reported back by the backend.
+ *
+ * `promptTokens` is the ground truth the token estimator calibrates against —
+ * it is the one number in the system that is not a guess. `promptEvalMs` is the
+ * prefill wall time; the ratio of the two is the prefix-cache-hit proxy (a
+ * reused KV prefix means many prompt tokens for almost no prefill time).
+ *
+ * Only the native transport reports prefill timing; the OpenAI-compatible shim
+ * gives token counts but no durations, so `promptEvalMs` is undefined there.
+ */
+export type NomadChatUsage = {
+  promptTokens?: number
+  completionTokens?: number
+  promptEvalMs?: number
 }
 
 export type NomadChatResponse = {
   message: { content: string; thinking?: string }
   done: boolean
   model: string
+  usage?: NomadChatUsage
+  /**
+   * Whether the decoder was grammar-constrained for this request — `format` was
+   * requested AND the request went out over the native transport that honours it.
+   *
+   * This is what lets a caller tell its two failure modes apart. False means the
+   * model was free to answer in prose and a string parser is the right recovery;
+   * true means unparseable output is the model breaking its own grammar (a
+   * truncated object, in practice) and the caller must take its safe path rather
+   * than feed a JSON fragment to a parser written for prose.
+   */
+  structured?: boolean
+  /**
+   * Why generation stopped, in Ollama's vocabulary: 'stop' for a natural end,
+   * 'length' when num_predict / max_tokens cut it off. Snake case because this
+   * object goes to API clients as-is and that is the field name they know.
+   */
+  done_reason?: string
 }
 
 export type NomadChatStreamChunk = {
   message: { content: string; thinking?: string }
   done: boolean
+  // Present only on the final chunk of a stream.
+  usage?: NomadChatUsage
+  // Present only on the chunk that ends generation. See NomadChatResponse.
+  done_reason?: string
 }
 
 type ChatInput = {
   model: string
-  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+  messages: ChatCompletionMessageParam[]
   think?: boolean | 'medium'
+  // Whether the target model supports thinking. Lets chat()/chatStream() tell "capable but
+  // disabled" (send reasoning_effort:'none') apart from "not capable" (send nothing).
+  thinkingCapable?: boolean
   stream?: boolean
+  // Context window for this request. Only reaches the model on the native transport —
+  // Ollama's OpenAI-compatible endpoint has no context-size field and silently drops it.
   numCtx?: number
+  // Cap on generated tokens, so a long answer can't run past the end of the window.
+  numPredict?: number
+  // How long to keep the model (and its KV cache) resident after this request.
+  // Unset inherits Ollama's 5-minute default.
+  keepAlive?: string | number
+  // Sampling controls. Left unset for normal chat, which inherits the backend's
+  // defaults — the historical behaviour. The eval harness sets temperature 0 and
+  // a fixed seed so repeated runs are as close to comparable as llama.cpp allows
+  // (batching and GPU non-determinism still move outputs, hence --repeats).
+  temperature?: number
+  seed?: number
+  // Resolved sampler settings for this request: top_p, top_k, min_p and
+  // repeat_penalty. Set from the user's Response Style on the chat path only.
+  // The ancillary structured calls deliberately leave it unset — they pin
+  // temperature to 0 and want a grammar honoured, not a style applied.
+  //
+  // `temperature` above still wins over `sampler.temperature`, so a caller that
+  // asks for determinism gets it whatever style the user has chosen.
+  sampler?: SamplerProfile
+  // JSON Schema (or the string 'json') constraining the decoder, for the structured
+  // ancillary calls — title, suggestion chips, query rewrite. Native-only: it is a
+  // top-level field on /api/chat, not an `options` member, and the OpenAI-compat
+  // endpoint has no equivalent we can rely on across backends. Callers must keep a
+  // string-parsing fallback for exactly that reason.
+  format?: string | object
+  // Aborts the upstream request when the client disconnects, so an abandoned generation
+  // doesn't keep decoding server-side and block Ollama's single parallel slot (#1065).
+  signal?: AbortSignal
+}
+
+/**
+ * Ollama's native /api/chat does not take OpenAI content parts. It carries images
+ * as a sibling `images` array of bare base64 (no `data:` prefix) on the message,
+ * with `content` staying a plain string. The OpenAI-compat path takes the parts
+ * as-is, so the conversion only belongs on the native side.
+ */
+function toNativeMessages(messages: ChatInput['messages']): Array<{
+  role: string
+  content: string
+  images?: string[]
+}> {
+  return messages.map((message) => {
+    const content = (message as { content?: unknown }).content
+    if (!Array.isArray(content)) {
+      return { role: message.role as string, content: (content as string) ?? '' }
+    }
+
+    const text: string[] = []
+    const images: string[] = []
+    for (const part of content as Array<Record<string, any>>) {
+      if (part?.type === 'text' && typeof part.text === 'string') {
+        text.push(part.text)
+      } else if (part?.type === 'image_url' && typeof part.image_url?.url === 'string') {
+        // Strip the data URL wrapper; Ollama wants the payload only.
+        images.push(part.image_url.url.replace(/^data:[^;]+;base64,/, ''))
+      }
+    }
+
+    const out: { role: string; content: string; images?: string[] } = {
+      role: message.role as string,
+      content: text.join('\n'),
+    }
+    if (images.length > 0) out.images = images
+    return out
+  })
 }
 
 @inject()
 export class OllamaService {
   private openai: OpenAI | null = null
+  private ollama: Ollama | null = null
   private baseUrl: string | null = null
   private initPromise: Promise<void> | null = null
   private isOllamaNative: boolean | null = null
+  private nativeProbe: Promise<boolean> | null = null
   private activeDownloads: Map<string, Promise<{ success: boolean; message: string; retryable?: boolean }>> = new Map()
+  // Memoized /api/show result per model name (see getModelInfo). A model's capabilities and
+  // trained context length don't change at runtime. Only successful lookups are cached;
+  // transient failures are left uncached so they can be retried.
+  private modelInfoCache: Map<string, NomadModelInfo> = new Map()
+  // Definitive capabilities are stable for a loaded model. Cache unknown results briefly to
+  // avoid adding repeated endpoint probes to chat startup while still allowing backend reloads.
+  private modelCapabilityCache: Map<
+    string,
+    { value: ModelCapabilities; expiresAt: number }
+  > = new Map()
 
   constructor() {}
 
@@ -78,9 +243,63 @@ export class OllamaService {
           apiKey: 'nomad', // Required by SDK; not validated by Ollama/LM Studio/llama.cpp
           baseURL: `${this.baseUrl}/v1`,
         })
+        // Native client for `/api/chat`. Only used when the backend is really Ollama
+        // (see _isNativeBackend) — it is the only transport that can set the context window.
+        this.ollama = new Ollama({ host: this.baseUrl })
       })()
     }
     return this.initPromise
+  }
+
+  /**
+   * Whether the configured backend is Ollama itself rather than some other
+   * OpenAI-compatible server (LM Studio, llama.cpp, vLLM, ...).
+   *
+   * This matters for one reason above all: `num_ctx` cannot be set over the
+   * OpenAI-compatible endpoint. Ollama's compatibility layer has no
+   * context-size field, so a request that needs a specific window has to go
+   * through native `/api/chat`. Everything else degrades gracefully; the
+   * context window does not.
+   *
+   * `getModels` also sets `isOllamaNative` as a side effect, so a probe is only
+   * fired when nothing has established it yet. The probe result is memoized for
+   * the process lifetime — the backend URL cannot change without a restart.
+   */
+  private async _isNativeBackend(): Promise<boolean> {
+    if (this.isOllamaNative !== null) return this.isOllamaNative
+    if (!this.nativeProbe) {
+      this.nativeProbe = (async () => {
+        try {
+          const response = await axios.get(`${this.baseUrl}/api/tags`, { timeout: 5000 })
+          // LM Studio answers 200 on unknown paths with an incompatible body — validate the shape.
+          this.isOllamaNative = Array.isArray(response.data?.models)
+        } catch (err) {
+          if (axios.isAxiosError(err) && err.response === undefined) {
+            // No HTTP response at all: the backend is unreachable (down, starting, or busy
+            // past the timeout), which proves nothing about its identity. A busy Ollama
+            // times out exactly like a non-Ollama server here, and memoizing `false` for
+            // the process lifetime blocks model pulls with a misleading error (#1349).
+            // Degrade for this call only and let the next caller re-probe.
+            this.nativeProbe = null
+            logger.info(
+              '[OllamaService] Native-API probe could not reach the backend; leaving the backend type undetermined and re-probing on next use.'
+            )
+            return false
+          }
+          // The backend answered (non-2xx status, or a 200 with a non-Ollama body via the
+          // shape check above): that is a live server that does not speak the native API.
+          this.isOllamaNative = false
+        }
+        if (!this.isOllamaNative) {
+          logger.info(
+            '[OllamaService] Backend is not Ollama-native; num_ctx cannot be set per request. ' +
+              'Context budgeting will assume the backend default.'
+          )
+        }
+        return this.isOllamaNative
+      })()
+    }
+    return this.nativeProbe
   }
 
   private async _ensureDependencies() {
@@ -203,58 +422,62 @@ export class OllamaService {
           buffer = lines.pop() || ''
           for (const line of lines) {
             if (!line.trim()) continue
-            let parsed: any
             try {
-              parsed = JSON.parse(line)
+              const parsed = JSON.parse(line)
+              // Ollama reports pull failures IN-BAND: the HTTP request returns 200 and the
+              // failure arrives as a line in the NDJSON body, e.g.
+              //   {"error":"pull model manifest: file does not exist"}
+              // The 'error' event below only fires for transport failures (a destroyed
+              // socket), so without this the line is dropped, the stream ends cleanly, and
+              // a pull that transferred nothing is reported to the user as a success.
+              if (parsed.error) {
+                const message =
+                  typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error)
+                const err: any = new Error(message)
+                err.code = 'ERR_OLLAMA_PULL'
+                pullResponse.data.destroy(err)
+                return
+              }
+              if (parsed.completed && parsed.total && parsed.digest) {
+                // Update this digest's progress — take the max seen value so transient
+                // out-of-order updates don't make the aggregate jump backwards.
+                const existing = digestProgress.get(parsed.digest)
+                digestProgress.set(parsed.digest, {
+                  completed: Math.max(existing?.completed ?? 0, parsed.completed),
+                  total: Math.max(existing?.total ?? 0, parsed.total),
+                })
+
+                // Compute aggregate across all known blobs
+                let aggCompleted = 0
+                let aggTotal = 0
+                for (const { completed, total } of digestProgress.values()) {
+                  aggCompleted += completed
+                  aggTotal += total
+                }
+
+                const percent = aggTotal > 0
+                  ? parseFloat(((aggCompleted / aggTotal) * 100).toFixed(2))
+                  : 0
+
+                // Throttle broadcasts. Always call the progressCallback though — the worker
+                // uses it to update job state in Redis, which should reflect the latest view.
+                const now = Date.now()
+                if (now - lastBroadcastAt >= BROADCAST_THROTTLE_MS) {
+                  lastBroadcastAt = now
+                  this.broadcastDownloadProgress(model, percent, jobId, {
+                    downloadedBytes: aggCompleted,
+                    totalBytes: aggTotal,
+                  })
+                }
+                if (progressCallback) {
+                  progressCallback(percent, {
+                    downloadedBytes: aggCompleted,
+                    totalBytes: aggTotal,
+                  })
+                }
+              }
             } catch {
-              // partial / non-JSON line — wait for more data
-              continue
-            }
-
-            // Ollama can stream {"error":"..."} on HTTP 200 (model not found,
-            // platform restriction, manifest 412). Reject so the catch path runs.
-            if (parsed.error) {
-              if (signal) signal.removeEventListener('abort', onAbort)
-              return reject(new Error(parsed.error))
-            }
-
-            if (parsed.completed && parsed.total && parsed.digest) {
-              // Update this digest's progress — take the max seen value so transient
-              // out-of-order updates don't make the aggregate jump backwards.
-              const existing = digestProgress.get(parsed.digest)
-              digestProgress.set(parsed.digest, {
-                completed: Math.max(existing?.completed ?? 0, parsed.completed),
-                total: Math.max(existing?.total ?? 0, parsed.total),
-              })
-
-              // Compute aggregate across all known blobs
-              let aggCompleted = 0
-              let aggTotal = 0
-              for (const { completed, total } of digestProgress.values()) {
-                aggCompleted += completed
-                aggTotal += total
-              }
-
-              const percent = aggTotal > 0
-                ? parseFloat(((aggCompleted / aggTotal) * 100).toFixed(2))
-                : 0
-
-              // Throttle broadcasts. Always call the progressCallback though — the worker
-              // uses it to update job state in Redis, which should reflect the latest view.
-              const now = Date.now()
-              if (now - lastBroadcastAt >= BROADCAST_THROTTLE_MS) {
-                lastBroadcastAt = now
-                this.broadcastDownloadProgress(model, percent, jobId, {
-                  downloadedBytes: aggCompleted,
-                  totalBytes: aggTotal,
-                })
-              }
-              if (progressCallback) {
-                progressCallback(percent, {
-                  downloadedBytes: aggCompleted,
-                  totalBytes: aggTotal,
-                })
-              }
+              // ignore parse errors on partial lines
             }
           }
         })
@@ -267,6 +490,22 @@ export class OllamaService {
           reject(err)
         })
       })
+
+      // A clean stream end is not proof the model landed. Ollama can end the stream without
+      // an error line, and historically any such case was reported to the user as a
+      // successful download. Confirm against the installed list before claiming success.
+      //
+      // includeEmbeddings must be true: getModels() filters out anything with "embed" in the
+      // name by default, so nomic-embed-text would otherwise fail verification after a
+      // perfectly good pull. Names are normalised because Ollama resolves a bare name to
+      // ":latest", so a pull of "llama3.1" comes back as "llama3.1:latest".
+      const tag = (n: string) => (n.includes(':') ? n : `${n}:latest`)
+      const installedAfter = await this.getModels(true)
+      if (!installedAfter.some((m) => tag(m.name) === tag(model))) {
+        throw new Error(
+          'Ollama reported no error but the model is not installed. The download did not complete.'
+        )
+      }
 
       logger.info(`[OllamaService] Model "${model}" downloaded successfully.`)
       return { success: true, message: 'Model downloaded successfully.' }
@@ -288,32 +527,35 @@ export class OllamaService {
         `[OllamaService] Failed to download model "${model}": ${errorMessage}`
       )
 
-      // Permanent failures return retryable: false so BullMQ doesn't retry 40x.
+      // Check for version mismatch (Ollama 412 response)
       const isVersionMismatch = errorMessage.includes('newer version of Ollama')
-      const isPlatformRestricted =
-        errorMessage.includes('requires macOS') ||
-        errorMessage.includes('requires linux') ||
-        errorMessage.includes('requires windows')
+
+      // An in-band pull error that says the model does not exist is permanent. Retrying it
+      // ten times on an exponential backoff just leaves the user watching a "delayed" job
+      // for hours instead of showing them the real reason, which is a bad model name.
+      const isPlatformRestricted = /requires (macOS|linux|windows)/i.test(errorMessage)
       const isManifestMissing =
-        /manifest/i.test(errorMessage) &&
-        (/(file does not exist|not found)/i.test(errorMessage) || /\b404\b/.test(errorMessage))
+        /manifest/i.test(errorMessage) && /file does not exist|not found|\b404\b/i.test(errorMessage)
+      const isPermanentPullError =
+        (error as any)?.code === 'ERR_OLLAMA_PULL' &&
+        /manifest|not found|does not exist|unauthorized|no such/i.test(errorMessage)
 
-      let userMessage: string
-      if (isVersionMismatch) {
-        userMessage = `Model "${model}" requires a newer version of Ollama. Please update AI Assistant from the Apps page.`
-      } else if (isPlatformRestricted) {
-        userMessage = `Model "${model}" is restricted to a different platform on Ollama's registry. Tags like nvfp4, mxfp8, and mlx-* are often macOS-only. Try a q4_K_M, q5_K_M, q6_K, or q8_0 variant instead.`
-      } else if (isManifestMissing) {
-        userMessage = `Model "${model}" was not found on Ollama's registry. The tag may not exist — try a different quantization (e.g. q4_K_M, q5_K_M, q8_0).`
-      } else {
-        userMessage = `Failed to download model "${model}": ${errorMessage}`
-      }
+      const userMessage = isVersionMismatch
+        ? 'This model requires a newer version of Ollama. Please update AI Assistant from the Apps page.'
+        : isPlatformRestricted
+          ? `Model "${model}" requires a different platform. Try a different model tag.`
+          : isManifestMissing || isPermanentPullError
+            ? `Ollama could not find this model: ${errorMessage}`
+            : `Failed to download model: ${errorMessage}`
 
-      const isRetryable = !isVersionMismatch && !isPlatformRestricted && !isManifestMissing
-
+      // Broadcast failure to connected clients so UI can show the error
       this.broadcastDownloadError(model, userMessage)
 
-      return { success: false, message: userMessage, retryable: isRetryable }
+      return {
+        success: false,
+        message: userMessage,
+        retryable: !isVersionMismatch && !isPlatformRestricted && !isManifestMissing && !isPermanentPullError,
+      }
     }
   }
 
@@ -341,126 +583,322 @@ export class OllamaService {
     }
   }
 
-  public async chat(chatRequest: ChatInput): Promise<NomadChatResponse> {
-    await this._ensureDependencies()
-    if (!this.openai) {
-      throw new Error('AI client is not initialized.')
+  /**
+   * Build the `options` bag for the native `/api/chat` endpoint.
+   *
+   * Note `num_ctx` must be *stable per model* across a session. Ollama unloads
+   * and reloads a model whenever a request asks for a different context size
+   * than the loaded instance, which stalls the turn and throws away the KV
+   * cache. Callers get their value from ContextWindowResolver, which memoizes
+   * per model precisely so this stays constant.
+   */
+  private _nativeOptions(chatRequest: ChatInput): Record<string, number> {
+    const options: Record<string, number> = {}
+    if (chatRequest.numCtx) options.num_ctx = chatRequest.numCtx
+    if (chatRequest.numPredict) options.num_predict = chatRequest.numPredict
+    // Spread first so an explicit temperature below overrides the style's.
+    Object.assign(options, nativeSamplerOptions(chatRequest.sampler))
+    if (chatRequest.sampler?.temperature !== undefined) {
+      options.temperature = chatRequest.sampler.temperature
     }
+    if (chatRequest.temperature !== undefined) options.temperature = chatRequest.temperature
+    if (chatRequest.seed !== undefined) options.seed = chatRequest.seed
+    return options
+  }
 
+  /**
+   * Params for the OpenAI-compatible endpoint.
+   *
+   * Deliberately does NOT send `num_ctx`: Ollama's compatibility layer has no
+   * context-size field and silently discards it (the PR to add one, ollama#6137,
+   * was closed unmerged). It used to be sent here as a top-level field, which
+   * meant the entire context-window ladder was a no-op and every conversation
+   * silently ran at the backend default. `max_tokens` is the one generation
+   * bound this endpoint does honour.
+   */
+  private _compatParams(chatRequest: ChatInput, stream: boolean): any {
     const params: any = {
       model: chatRequest.model,
       messages: chatRequest.messages as ChatCompletionMessageParam[],
-      stream: false,
+      stream,
     }
     if (chatRequest.think) {
       params.think = chatRequest.think
     }
-    if (chatRequest.numCtx) {
-      params.num_ctx = chatRequest.numCtx
+    // The /v1 (OpenAI-compat) endpoint ignores `think`; `reasoning_effort` is the actual lever.
+    // Only touch it for thinking-capable models so non-Ollama backends never get an unexpected
+    // param. gpt-oss requires an explicit level; a capable-but-disabled model gets 'none' to
+    // suppress thinking (capable models default thinking ON otherwise, so think===true is a no-op).
+    if (chatRequest.think === 'medium') {
+      params.reasoning_effort = 'medium'
+    } else if (chatRequest.thinkingCapable && chatRequest.think === false) {
+      params.reasoning_effort = 'none'
+    }
+    if (chatRequest.numPredict) {
+      params.max_tokens = chatRequest.numPredict
+    }
+    // min_p, top_k and repeat_penalty have no equivalent here, so the style
+    // reaches this transport as temperature plus a nucleus value and nothing else.
+    Object.assign(params, compatSamplerParams(chatRequest.sampler))
+    if (chatRequest.sampler?.temperature !== undefined) {
+      params.temperature = chatRequest.sampler.temperature
+    }
+    if (chatRequest.temperature !== undefined) {
+      params.temperature = chatRequest.temperature
+    }
+    if (chatRequest.seed !== undefined) {
+      params.seed = chatRequest.seed
+    }
+    if (stream) {
+      // Without this the streaming path reports no token usage at all, and the
+      // estimator has nothing to calibrate against on non-native backends.
+      params.stream_options = { include_usage: true }
+    }
+    return params
+  }
+
+  public async chat(chatRequest: ChatInput): Promise<NomadChatResponse> {
+    await this._ensureDependencies()
+    if (await this._isNativeBackend()) {
+      return this._chatNative(chatRequest)
+    }
+    return this._chatCompat(chatRequest)
+  }
+
+  private async _chatNative(chatRequest: ChatInput): Promise<NomadChatResponse> {
+    if (!this.ollama) {
+      throw new Error('AI client is not initialized.')
     }
 
-    const response = await this.openai.chat.completions.create(params)
-    const choice = response.choices[0]
+    const response = await this.ollama.chat({
+      model: chatRequest.model,
+      messages: toNativeMessages(chatRequest.messages) as any,
+      stream: false,
+      // Definedness, not truthiness: `think: false` has to reach Ollama, which
+      // otherwise leaves thinking ON for a capable model. Unset still sends
+      // nothing, so non-thinking models and other backends are unaffected.
+      ...(chatRequest.think !== undefined ? { think: chatRequest.think } : {}),
+      ...(chatRequest.keepAlive !== undefined ? { keep_alive: chatRequest.keepAlive } : {}),
+      // Sibling of `options`, not a member of it — putting it in the options bag is
+      // silently ignored and the call decodes unconstrained.
+      ...(chatRequest.format !== undefined ? { format: chatRequest.format } : {}),
+      options: this._nativeOptions(chatRequest),
+    })
+
+    // A model can report reasoning on the structured field and still emit literal
+    // <think> tags in content; the splitter is a no-op on text that has none.
+    const split = normalizeNonStreamed(
+      response.message?.content ?? '',
+      response.message?.thinking ?? ''
+    )
 
     return {
       message: {
-        content: choice.message.content ?? '',
-        thinking: (choice.message as any).thinking ?? undefined,
+        content: split.content,
+        thinking: split.thinking || undefined,
       },
       done: true,
       model: response.model,
+      // The grammar reached the model only if a caller asked for one; this is the
+      // native transport, so requesting it is the same as applying it.
+      structured: chatRequest.format !== undefined,
+      ...(response.done_reason ? { done_reason: response.done_reason } : {}),
+      usage: {
+        promptTokens: response.prompt_eval_count,
+        completionTokens: response.eval_count,
+        promptEvalMs: nsToMs(response.prompt_eval_duration),
+      },
+    }
+  }
+
+  private async _chatCompat(chatRequest: ChatInput): Promise<NomadChatResponse> {
+    if (!this.openai) {
+      throw new Error('AI client is not initialized.')
+    }
+
+    const params = this._compatParams(chatRequest, false)
+    const response = await this.openai.chat.completions.create(params, { signal: chatRequest.signal })
+    const choice = response.choices[0]
+
+    // Ollama's OpenAI-compat endpoint (/v1) emits thinking as `reasoning`; its native
+    // shape uses `thinking`. Read both so thinking is never silently dropped (#1065).
+    // Backends that emit tags inline instead (LM Studio, llama.cpp) are handled by the split.
+    const split = normalizeNonStreamed(
+      choice.message.content ?? '',
+      (choice.message as any).thinking ?? (choice.message as any).reasoning ?? ''
+    )
+
+    return {
+      message: {
+        content: split.content,
+        thinking: split.thinking || undefined,
+      },
+      done: true,
+      model: response.model,
+      // `format` is dropped on this transport whether or not the caller sent one,
+      // so the response is unconstrained prose and the caller's string parser is
+      // still the correct way to recover it.
+      structured: false,
+      ...(choice.finish_reason ? { done_reason: choice.finish_reason } : {}),
+      usage: {
+        promptTokens: response.usage?.prompt_tokens,
+        completionTokens: response.usage?.completion_tokens,
+      },
     }
   }
 
   public async chatStream(chatRequest: ChatInput): Promise<AsyncIterable<NomadChatStreamChunk>> {
     await this._ensureDependencies()
-    if (!this.openai) {
+    if (await this._isNativeBackend()) {
+      return this._chatStreamNative(chatRequest)
+    }
+    return this._chatStreamCompat(chatRequest)
+  }
+
+  private async _chatStreamNative(
+    chatRequest: ChatInput
+  ): Promise<AsyncIterable<NomadChatStreamChunk>> {
+    if (!this.ollama) {
       throw new Error('AI client is not initialized.')
     }
 
-    const params: any = {
+    const iterator = await this.ollama.chat({
       model: chatRequest.model,
-      messages: chatRequest.messages as ChatCompletionMessageParam[],
+      messages: toNativeMessages(chatRequest.messages) as any,
       stream: true,
-    }
-    if (chatRequest.think) {
-      params.think = chatRequest.think
-    }
-    if (chatRequest.numCtx) {
-      params.num_ctx = chatRequest.numCtx
-    }
+      // See _chatNative: `think: false` must be sent explicitly, or a thinking-capable
+      // model keeps reasoning regardless of the user's ai.autoThinking preference.
+      ...(chatRequest.think !== undefined ? { think: chatRequest.think } : {}),
+      ...(chatRequest.keepAlive !== undefined ? { keep_alive: chatRequest.keepAlive } : {}),
+      options: this._nativeOptions(chatRequest),
+    })
 
-    const stream = (await this.openai.chat.completions.create(params)) as unknown as Stream<ChatCompletionChunk>
-
-    // Returns how many trailing chars of `text` could be the start of `tag`
-    function partialTagSuffix(tag: string, text: string): number {
-      for (let len = Math.min(tag.length - 1, text.length); len >= 1; len--) {
-        if (text.endsWith(tag.slice(0, len))) return len
-      }
-      return 0
+    // The native client aborts through the iterator rather than a fetch signal, so bridge
+    // the caller's AbortSignal onto it. Without this a disconnected client would leave the
+    // generation decoding server-side and block Ollama's single parallel slot (#1065).
+    const onAbort = () => iterator.abort()
+    if (chatRequest.signal) {
+      if (chatRequest.signal.aborted) iterator.abort()
+      else chatRequest.signal.addEventListener('abort', onAbort, { once: true })
     }
 
     async function* normalize(): AsyncGenerator<NomadChatStreamChunk> {
-      // Stateful parser for <think>...</think> tags that may be split across chunks.
-      // Ollama provides thinking natively via delta.thinking; OpenAI-compatible backends
-      // (LM Studio, llama.cpp, etc.) embed them inline in delta.content.
-      let tagBuffer = ''
-      let inThink = false
-
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta
-        const nativeThinking: string = (delta as any)?.thinking ?? ''
-        const rawContent: string = delta?.content ?? ''
-
-        // Parse <think> tags out of the content stream
-        tagBuffer += rawContent
-        let parsedContent = ''
-        let parsedThinking = ''
-
-        while (tagBuffer.length > 0) {
-          if (inThink) {
-            const closeIdx = tagBuffer.indexOf('</think>')
-            if (closeIdx !== -1) {
-              parsedThinking += tagBuffer.slice(0, closeIdx)
-              tagBuffer = tagBuffer.slice(closeIdx + 8)
-              inThink = false
-            } else {
-              const hold = partialTagSuffix('</think>', tagBuffer)
-              parsedThinking += tagBuffer.slice(0, tagBuffer.length - hold)
-              tagBuffer = tagBuffer.slice(tagBuffer.length - hold)
-              break
-            }
-          } else {
-            const openIdx = tagBuffer.indexOf('<think>')
-            if (openIdx !== -1) {
-              parsedContent += tagBuffer.slice(0, openIdx)
-              tagBuffer = tagBuffer.slice(openIdx + 7)
-              inThink = true
-            } else {
-              const hold = partialTagSuffix('<think>', tagBuffer)
-              parsedContent += tagBuffer.slice(0, tagBuffer.length - hold)
-              tagBuffer = tagBuffer.slice(tagBuffer.length - hold)
-              break
-            }
+      // Ollama reports reasoning on its own field, so no tag parsing is needed here —
+      // but a model can still emit literal <think> tags inside content, and the splitter
+      // is a no-op on text that has none.
+      const splitter = new ThinkTagSplitter()
+      try {
+        for await (const chunk of iterator) {
+          const split = splitter.push(chunk.message?.content ?? '')
+          const nativeThinking = chunk.message?.thinking ?? ''
+          yield {
+            message: {
+              content: split.content,
+              thinking: nativeThinking + split.thinking,
+            },
+            done: chunk.done === true,
+            ...(chunk.done
+              ? {
+                  ...(chunk.done_reason ? { done_reason: chunk.done_reason } : {}),
+                  usage: {
+                    promptTokens: chunk.prompt_eval_count,
+                    completionTokens: chunk.eval_count,
+                    promptEvalMs: nsToMs(chunk.prompt_eval_duration),
+                  },
+                }
+              : {}),
           }
         }
-
-        yield {
-          message: {
-            content: parsedContent,
-            thinking: nativeThinking + parsedThinking,
-          },
-          done: chunk.choices[0]?.finish_reason !== null && chunk.choices[0]?.finish_reason !== undefined,
+        const tail = splitter.flush()
+        if (tail.content || tail.thinking) {
+          yield { message: { content: tail.content, thinking: tail.thinking }, done: true }
         }
+      } finally {
+        chatRequest.signal?.removeEventListener('abort', onAbort)
       }
     }
 
     return normalize()
   }
 
-  public async checkModelHasThinking(modelName: string): Promise<boolean> {
+  private async _chatStreamCompat(
+    chatRequest: ChatInput
+  ): Promise<AsyncIterable<NomadChatStreamChunk>> {
+    if (!this.openai) {
+      throw new Error('AI client is not initialized.')
+    }
+
+    const params = this._compatParams(chatRequest, true)
+    const stream = (await this.openai.chat.completions.create(params, {
+      signal: chatRequest.signal,
+    })) as unknown as Stream<ChatCompletionChunk>
+
+    async function* normalize(): AsyncGenerator<NomadChatStreamChunk> {
+      // Stateful parser for <think>...</think> tags that may be split across chunks.
+      // Ollama provides thinking natively via delta.thinking; OpenAI-compatible backends
+      // (LM Studio, llama.cpp, etc.) embed them inline in delta.content.
+      const splitter = new ThinkTagSplitter()
+
+      for await (const chunk of stream) {
+        // With stream_options.include_usage the final chunk carries usage and no choices.
+        if (chunk.usage && (chunk.choices?.length ?? 0) === 0) {
+          yield {
+            message: { content: '', thinking: '' },
+            done: true,
+            usage: {
+              promptTokens: chunk.usage.prompt_tokens,
+              completionTokens: chunk.usage.completion_tokens,
+            },
+          }
+          continue
+        }
+
+        const delta = chunk.choices[0]?.delta
+        // /v1 emits thinking as `reasoning`; native Ollama uses `thinking`. Read both (#1065).
+        const nativeThinking: string = (delta as any)?.thinking ?? (delta as any)?.reasoning ?? ''
+        const split = splitter.push(delta?.content ?? '')
+
+        const finishReason = chunk.choices[0]?.finish_reason
+        yield {
+          message: {
+            content: split.content,
+            thinking: nativeThinking + split.thinking,
+          },
+          done: finishReason !== null && finishReason !== undefined,
+          // OpenAI's finish_reason uses the same 'stop' / 'length' values.
+          ...(finishReason ? { done_reason: finishReason } : {}),
+        }
+      }
+
+      // A partial tag held at end of stream was never a tag; emitting it prevents a
+      // silently truncated answer.
+      const tail = splitter.flush()
+      if (tail.content || tail.thinking) {
+        yield { message: { content: tail.content, thinking: tail.thinking }, done: true }
+      }
+    }
+
+    return normalize()
+  }
+
+  /**
+   * Everything `/api/show` knows about a model, memoized per model name.
+   *
+   * A model's capabilities and trained context length don't change at runtime, so
+   * this collapses to a single call per model per process. Without memoization,
+   * loading the chat picker fires one /api/show per installed model and every chat
+   * send fires another.
+   *
+   * Returns a zero-information record (not a throw) when the backend has no
+   * /api/show — every caller has to cope with a non-Ollama backend anyway, and a
+   * missing context length is a legitimate answer meaning "assume the default".
+   */
+  public async getModelInfo(modelName: string): Promise<NomadModelInfo> {
     await this._ensureDependencies()
-    if (!this.baseUrl) return false
+    if (!this.baseUrl) return { hasThinking: false }
+
+    const cached = this.modelInfoCache.get(modelName)
+    if (cached !== undefined) return cached
 
     try {
       const response = await axios.post(
@@ -468,11 +906,72 @@ export class OllamaService {
         { model: modelName },
         { timeout: 5000 }
       )
-      return Array.isArray(response.data?.capabilities) && response.data.capabilities.includes('thinking')
+      const data = response.data ?? {}
+      const info: NomadModelInfo = {
+        hasThinking: Array.isArray(data.capabilities) && data.capabilities.includes('thinking'),
+        contextLength: readContextLength(data.model_info),
+        parameterSize: data.details?.parameter_size,
+        quantizationLevel: data.details?.quantization_level,
+        modelfileNumCtx: readModelfileNumCtx(data.parameters),
+        modelfileSamplers: readModelfileSamplers(data.parameters),
+        rawModelInfo: data.model_info,
+      }
+      this.modelInfoCache.set(modelName, info)
+      return info
     } catch {
-      // Non-Ollama backends don't expose /api/show — assume no thinking support
-      return false
+      // Non-Ollama backends don't expose /api/show. Left uncached so a transient
+      // failure can be retried rather than poisoning the process.
+      return { hasThinking: false }
     }
+  }
+
+  public async getModelCapabilities(
+    modelName: string,
+    advertisedMetadata?: unknown
+  ): Promise<ModelCapabilities> {
+    await this._ensureDependencies()
+    if (!this.baseUrl) return { thinking: false, vision: 'unknown' }
+
+    const cached = this.modelCapabilityCache.get(modelName)
+    if (cached && cached.expiresAt > Date.now()) return cached.value
+
+    // Composite OpenAI-compatible routers can advertise different capabilities for each
+    // model, and that metadata is passed through here. A list that omits vision is not
+    // trusted on its own (see resolveModelCapabilities), so the model is still probed.
+    // Hybrid routers may expose /v1/models plus /api/show without exposing /api/tags.
+    const detected = await resolveModelCapabilities(advertisedMetadata, {
+      ollamaShow: async () => {
+        const response = await axios.post(
+          `${this.baseUrl}/api/show`,
+          { model: modelName },
+          { timeout: 3000 }
+        )
+        return response.data
+      },
+      // A direct llama.cpp server reports the loaded model's input modalities at /props.
+      llamaProps: async () => {
+        const response = await axios.get(`${this.baseUrl}/props`, { timeout: 3000 })
+        return response.data
+      },
+    })
+    if (detected) {
+      this.modelCapabilityCache.set(modelName, {
+        value: detected,
+        expiresAt: Number.POSITIVE_INFINITY,
+      })
+      return detected
+    }
+
+    const unknown: ModelCapabilities = { thinking: false, vision: 'unknown' }
+    this.modelCapabilityCache.set(modelName, {
+      value: unknown,
+      expiresAt: Date.now() + 30_000,
+    })
+    return unknown
+  }
+
+  public async checkModelHasThinking(modelName: string): Promise<boolean> {
+    return (await this.getModelInfo(modelName)).hasThinking
   }
 
   public async deleteModel(modelName: string): Promise<{ success: boolean; message: string }> {
@@ -508,8 +1007,42 @@ export class OllamaService {
   public static readonly EMBED_MAX_INPUT_CHARS = 4000
 
   /**
+   * Aggressive 2048-safe character cap, applied only on a context-length retry. nomic-embed-text:v1.5
+   * defaults to a 2048-token context, and on the OpenAI-compat fallback path (or an older Ollama that
+   * ignores num_ctx for embeddings) we cannot widen it at request time. 2000 chars stays under 2048
+   * tokens even for the densest content (~1 char/token code/markup), so an oversized chunk gets
+   * truncated-and-kept instead of silently dropped from Qdrant — and the embed job stops re-embedding
+   * the whole file 30x on the one bad chunk (#881).
+   */
+  public static readonly EMBED_CONTEXT_SAFE_CHARS = 2000
+
+  /**
+   * True if the error is the model rejecting input that exceeds its context window
+   * ("input length exceeds the context length"). Matches both the native /api/embed axios error
+   * shape and the OpenAI-compat BadRequestError. Drives the truncate-and-retry here and the
+   * non-retryable classification in EmbedFileJob (#881).
+   */
+  public static isContextLengthError(err: unknown): boolean {
+    const parts: string[] = []
+    if (err instanceof Error && err.message) parts.push(err.message)
+    const anyErr = err as any
+    const data = anyErr?.response?.data
+    if (data) parts.push(typeof data === 'string' ? data : JSON.stringify(data))
+    if (anyErr?.error) parts.push(typeof anyErr.error === 'string' ? anyErr.error : JSON.stringify(anyErr.error))
+    const haystack = parts.join(' ').toLowerCase()
+    return (
+      (haystack.includes('context length') && haystack.includes('exceed')) ||
+      haystack.includes('input length exceeds')
+    )
+  }
+
+  /**
    * Generate embeddings for the given input strings.
    * Tries the Ollama native /api/embed endpoint first, falls back to /v1/embeddings.
+   *
+   * If the first attempt fails because a chunk exceeds the model's context window, retries once
+   * with an aggressive 2048-safe truncation (EMBED_CONTEXT_SAFE_CHARS) so the chunk is embedded
+   * (start-of-chunk) rather than silently dropped from Qdrant (#881).
    */
   public async embed(model: string, input: string[]): Promise<{ embeddings: number[][] }> {
     await this._ensureDependencies()
@@ -517,71 +1050,102 @@ export class OllamaService {
       throw new Error('AI service is not initialized.')
     }
 
-    // Runtime safety net (#881). The OpenAI-compat fallback has no equivalent of
-    // truncate:true, so a chunk that exceeds the model's loaded context_length
-    // (often 2048 for nomic-embed-text:v1.5) returns 400 and the chunk is silently
-    // dropped from Qdrant. Pre-capping at the input layer protects both paths.
-    const safeInput = input.map((s) =>
-      s.length > OllamaService.EMBED_MAX_INPUT_CHARS
-        ? s.slice(0, OllamaService.EMBED_MAX_INPUT_CHARS)
-        : s
-    )
-    const truncatedCount = input.reduce(
-      (n, s) => (s.length > OllamaService.EMBED_MAX_INPUT_CHARS ? n + 1 : n),
-      0
-    )
-    if (truncatedCount > 0) {
-      logger.debug(
-        '[OllamaService] embed: pre-capped %d/%d inputs at %d chars',
-        truncatedCount,
-        input.length,
-        OllamaService.EMBED_MAX_INPUT_CHARS
-      )
-    }
+    const cap = (arr: string[], max: number) => arr.map((s) => (s.length > max ? s.slice(0, max) : s))
+
+    // Generous pre-cap (#881): fine for the native path (num_ctx=8192) but can still exceed a
+    // 2048-context fallback on dense content. The context-length retry below is the hard backstop.
+    const safeInput = cap(input, OllamaService.EMBED_MAX_INPUT_CHARS)
 
     try {
-      // Prefer Ollama native endpoint (supports batch input natively).
-      // Pass num_ctx explicitly so we don't depend on the embedding model's
-      // modelfile defaults. Some installs ship nomic-embed-text:v1.5 with
-      // num_ctx=2048, which our chunker (sized for ~1500 tokens) can exceed
-      // on dense content, causing "input length exceeds context length" errors.
-      // truncate:true is a runtime safety net for any chunk that still overshoots.
-      // 8192 matches nomic-embed-text:v1.5's RoPE-extrapolated max.
-      const response = await axios.post(
-        `${this.baseUrl}/api/embed`,
-        {
-          model,
-          input: safeInput,
-          truncate: true,
-          options: { num_ctx: 8192 },
-        },
-        { timeout: 60000 }
-      )
-      // Some backends (e.g. LM Studio) return HTTP 200 for unknown endpoints with an incompatible
-      // body — validate explicitly before accepting the result.
-      if (!Array.isArray(response.data?.embeddings)) {
-        throw new Error('Invalid /api/embed response — missing embeddings array')
-      }
-      return { embeddings: response.data.embeddings }
+      return await this._embedWithFallback(model, safeInput)
     } catch (err) {
-      // Capture the original error so we know *why* we fell back. Earlier bare
-      // catches here masked recurring "input length exceeds context length"
-      // failures for months (#369, #670, #881) — without this log we have no
-      // signal that /api/embed is the broken path vs the fallback.
+      if (!OllamaService.isContextLengthError(err)) throw err
+      // One or more chunks exceeded the model's context even after the pre-cap — typically an
+      // older Ollama that ignores num_ctx for embeddings, or the OpenAI-compat fallback path.
+      // Retry once, truncated hard enough to fit a 2048-token context at any density, so the
+      // chunk is embedded (truncated) instead of dropped and the job doesn't storm.
+      const hardCapped = cap(input, OllamaService.EMBED_CONTEXT_SAFE_CHARS)
+      const reduced = hardCapped.reduce((n, s, i) => (s.length < safeInput[i].length ? n + 1 : n), 0)
       logger.warn(
-        '[OllamaService] /api/embed failed, falling back to /v1/embeddings: %s',
-        err instanceof Error ? err.message : String(err)
+        '[OllamaService] embed: context-length overflow; retrying %d/%d inputs hard-capped at %d chars',
+        reduced,
+        input.length,
+        OllamaService.EMBED_CONTEXT_SAFE_CHARS
       )
-      // Fall back to OpenAI-compatible /v1/embeddings.
-      // Explicitly request float format — some backends (e.g. LM Studio) don't reliably
-      // implement the base64 encoding the OpenAI SDK requests by default.
-      const results = await this.openai.embeddings.create({
-        model,
-        input: safeInput,
-        encoding_format: 'float',
-      })
-      return { embeddings: results.data.map((e) => e.embedding as number[]) }
+      return await this._embedWithFallback(model, hardCapped)
     }
+  }
+
+  /**
+   * Single embed attempt: native /api/embed when the backend speaks it, otherwise (or on
+   * failure) the OpenAI-compat /v1/embeddings fallback. Both paths request num_ctx/truncate
+   * (Ollama's OpenAI-compat shim forwards them). A context-length error from the native path
+   * is re-thrown rather than falling back, because the fallback has a smaller effective
+   * context and would only fail the same way — the caller (embed) retries it truncated
+   * instead.
+   *
+   * The native attempt is gated on `_isNativeBackend()` (#1279). Against a backend that only
+   * speaks the OpenAI embeddings API, trying `/api/embed` unconditionally means a
+   * guaranteed-failing round trip plus a warn line before *every* batch. That is invisible on
+   * a handful of documents and expensive on a bulk `file-embeddings` job, where it doubles
+   * request volume against the embedding host for the lifetime of the ingest.
+   *
+   * Gated on the probe rather than on the `isOllamaNative` field directly: the field is null
+   * until something populates it, and an embed job can easily be the first thing to touch the
+   * service after a restart, in which case reading the raw field would skip the optimization
+   * exactly when it matters most. The probe memoizes for the process lifetime, so this costs
+   * one request overall, not one per batch.
+   */
+  private async _embedWithFallback(model: string, input: string[]): Promise<{ embeddings: number[][] }> {
+    if (await this._isNativeBackend()) {
+      try {
+        // Pass num_ctx explicitly so we don't depend on the embedding model's modelfile defaults.
+        // Some installs ship nomic-embed-text:v1.5 with num_ctx=2048; 8192 matches its RoPE-extrapolated
+        // max. truncate:true is a server-side net for any chunk that still overshoots.
+        const response = await axios.post(
+          `${this.baseUrl}/api/embed`,
+          {
+            model,
+            input,
+            truncate: true,
+            options: { num_ctx: 8192 },
+          },
+          { timeout: 60000 }
+        )
+        // Some backends (e.g. LM Studio) return HTTP 200 for unknown endpoints with an incompatible
+        // body — validate explicitly before accepting the result. Kept even though the probe now
+        // gates this path: the probe establishes that /api/tags answered like Ollama, which is not
+        // a promise that /api/embed will.
+        if (!Array.isArray(response.data?.embeddings)) {
+          throw new Error('Invalid /api/embed response — missing embeddings array')
+        }
+        return { embeddings: response.data.embeddings }
+      } catch (err) {
+        // Let context-length errors bubble so embed() can retry with a smaller cap; the fallback
+        // endpoint (smaller effective context, no num_ctx honored on older Ollama) can't help here.
+        if (OllamaService.isContextLengthError(err)) throw err
+        // Log the original error so we know *why* we fell back. Earlier bare catches here masked
+        // recurring failures for months (#369, #670, #881).
+        logger.warn(
+          '[OllamaService] /api/embed failed, falling back to /v1/embeddings: %s',
+          err instanceof Error ? err.message : String(err)
+        )
+      }
+    }
+
+    // OpenAI-compatible /v1/embeddings. Reached either because the backend isn't Ollama-native
+    // or because the native attempt above failed for a non-context reason. Explicitly request
+    // float format — some backends (e.g. LM Studio) don't reliably implement the base64 the
+    // OpenAI SDK defaults to. truncate/num_ctx are forwarded by Ollama's OpenAI-compat shim;
+    // the SDK types omit them, hence the cast.
+    const results = await this.openai!.embeddings.create({
+      model,
+      input,
+      encoding_format: 'float',
+      truncate: true,
+      options: { num_ctx: 8192 },
+    } as any)
+    return { embeddings: results.data.map((e) => e.embedding as number[]) }
   }
 
   /**
@@ -659,8 +1223,20 @@ export class OllamaService {
       return []
     }
 
+    // The tasks model is exempt for the same reason the embedding model is: it is
+    // infrastructure, not "a chat model the user picked". It runs the per-turn
+    // query rewrite, so evicting it here would mean a cold load on the very next
+    // message — and the whole point of routing the rewrite off the chat model was
+    // to stop the two from fighting over Ollama's single slot.
+    let tasksModel: string | null = null
+    try {
+      tasksModel = (await KVStore.getValue('ai.tasksModel'))?.trim() || null
+    } catch {
+      // Setting unreadable; fall through and treat it as unset.
+    }
+
     const toUnload = loadedModels.filter(
-      (name) => name !== EMBEDDING_MODEL_NAME && name !== targetModel
+      (name) => name !== EMBEDDING_MODEL_NAME && name !== targetModel && name !== tasksModel
     )
 
     await Promise.all(
@@ -701,16 +1277,27 @@ export class OllamaService {
         throw new Error('Not an Ollama-compatible /api/tags response')
       }
       this.isOllamaNative = true
+      this.nativeProbe = Promise.resolve(true)
       const models: NomadInstalledModel[] = response.data.models
       if (includeEmbeddings) return models
       return models.filter((m) => !m.name.includes('embed'))
-    } catch {
+    } catch (tagsErr) {
+      // Classify the backend only when it actually answered. A non-2xx status, or the
+      // shape-mismatch throw above (a 200 arrived with a non-Ollama body), proves a live
+      // server that does not speak the native API. A request that got NO response — a
+      // timeout while Ollama is busy or still starting, a refused connection — proves
+      // nothing, and marking it non-Ollama here made every model download fail with
+      // "pulling is only supported for Ollama backends" on stock installs (#1349).
+      const backendAnswered = axios.isAxiosError(tagsErr) ? tagsErr.response !== undefined : true
+      if (backendAnswered) {
+        this.isOllamaNative = false
+        this.nativeProbe = Promise.resolve(false)
+      }
       // Fall back to the OpenAI-compatible /v1/models endpoint (LM Studio, llama.cpp, etc.)
-      this.isOllamaNative = false
       logger.info('[OllamaService] /api/tags unavailable, falling back to /v1/models')
       try {
         const modelList = await this.openai!.models.list()
-        const models: NomadInstalledModel[] = modelList.data.map((m) => ({ name: m.id, size: 0 }))
+        const models: NomadInstalledModel[] = installedModelsFromOpenAIResponse(modelList)
         if (includeEmbeddings) return models
         return models.filter((m) => !m.name.includes('embed'))
       } catch (err) {
@@ -744,7 +1331,7 @@ export class OllamaService {
   ): Promise<{ models: NomadOllamaModel[]; hasMore: boolean } | null> {
     try {
       const models = await this.retrieveAndRefreshModels(sort, force)
-      if (!models) {
+      if (!models || models.length === 0) {
         logger.warn(
           '[OllamaService] Returning fallback recommended models due to failure in fetching available models'
         )
@@ -799,7 +1386,10 @@ export class OllamaService {
     try {
       if (!force) {
         const cachedModels = await this.readModelsFromCache()
-        if (cachedModels) {
+        // An empty cached array (e.g. written from a transient empty upstream
+        // response) must not be treated as valid data — fall through to a
+        // fresh fetch and, failing that, the fallback list.
+        if (cachedModels && cachedModels.length > 0) {
           logger.info('[OllamaService] Using cached available models data')
           return this.sortModels(cachedModels, sort)
         }
@@ -812,7 +1402,7 @@ export class OllamaService {
       const baseUrl = env.get('NOMAD_API_URL') || NOMAD_API_DEFAULT_BASE_URL
       const fullUrl = new URL(NOMAD_MODELS_API_PATH, baseUrl).toString()
 
-      const response = await axios.get(fullUrl)
+      const response = await axios.get(fullUrl, { timeout: 10000 })
       if (!response.data || !Array.isArray(response.data.models)) {
         logger.warn(
           `[OllamaService] Invalid response format when fetching available models: ${JSON.stringify(response.data)}`
@@ -828,6 +1418,16 @@ export class OllamaService {
           tags: model.tags.filter((tag) => !tag.cloud),
         }))
         .filter((model) => model.tags.length > 0)
+
+      // A successful-but-empty upstream response (0 models, or all filtered out
+      // as cloud-only) is a soft failure: return null so the caller serves the
+      // fallback list, and don't poison the 24h cache with an empty array.
+      if (noCloud.length === 0) {
+        logger.warn(
+          '[OllamaService] Nomad API returned no usable (non-cloud) models; using fallback'
+        )
+        return null
+      }
 
       await this.writeModelsToCache(noCloud)
       return this.sortModels(noCloud, sort)

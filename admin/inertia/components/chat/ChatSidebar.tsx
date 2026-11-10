@@ -5,6 +5,7 @@ import { ChatSession } from '../../../types/chat'
 import { IconMessage } from '@tabler/icons-react'
 import { useState } from 'react'
 import KnowledgeBaseModal from './KnowledgeBaseModal'
+import NomadMdModal from './NomadMdModal'
 
 interface ChatSidebarProps {
   sessions: ChatSession[]
@@ -13,6 +14,8 @@ interface ChatSidebarProps {
   onNewChat: () => void
   onClearHistory: () => void
   isInModal?: boolean
+  isMobileOpen?: boolean
+  onMobileClose?: () => void
 }
 
 export default function ChatSidebar({
@@ -22,11 +25,14 @@ export default function ChatSidebar({
   onNewChat,
   onClearHistory,
   isInModal = false,
+  isMobileOpen = false,
+  onMobileClose,
 }: ChatSidebarProps) {
   const { aiAssistantName } = usePage<{ aiAssistantName: string }>().props
   const [isKnowledgeBaseModalOpen, setIsKnowledgeBaseModalOpen] = useState(
     () => new URLSearchParams(window.location.search).get('knowledge_base') === 'true'
   )
+  const [isNomadMdModalOpen, setIsNomadMdModalOpen] = useState(false)
 
   function handleCloseKnowledgeBase() {
     setIsKnowledgeBaseModalOpen(false)
@@ -39,9 +45,25 @@ export default function ChatSidebar({
   }
 
   return (
-    <div className="w-64 bg-surface-secondary border-r border-border-subtle flex flex-col h-full">
+    <aside
+      id="chat-sidebar"
+      className={classNames(
+        'w-64 bg-surface-secondary border-r border-border-subtle flex-col h-full shrink-0',
+        'fixed inset-y-0 left-0 z-50 md:static md:z-auto md:flex',
+        isMobileOpen ? 'flex' : 'hidden'
+      )}
+      aria-label="Chat conversations"
+    >
       <div className="p-4 border-b border-border-subtle h-[75px] flex items-center justify-center">
-        <StyledButton onClick={onNewChat} icon="IconPlus" variant="primary" fullWidth>
+        <StyledButton
+          onClick={() => {
+            onNewChat()
+            onMobileClose?.()
+          }}
+          icon="IconPlus"
+          variant="primary"
+          fullWidth
+        >
           New Chat
         </StyledButton>
       </div>
@@ -54,7 +76,10 @@ export default function ChatSidebar({
             {sessions.map((session) => (
               <button
                 key={session.id}
-                onClick={() => onSessionSelect(session.id)}
+                onClick={() => {
+                  onSessionSelect(session.id)
+                  onMobileClose?.()
+                }}
                 className={classNames(
                   'w-full text-left px-3 py-2 rounded-lg transition-colors group',
                   activeSessionId === session.id
@@ -89,21 +114,20 @@ export default function ChatSidebar({
         )}
       </div>
       <div className="p-4 flex flex-col items-center justify-center gap-y-2">
-        <img src="/project_nomad_logo.webp" alt="Project Nomad Logo" className="h-28 w-28 mb-6" />
+        <img src="/nomad-primary.svg" alt="Project NOMAD Logo" className="h-28 w-28 mb-6 object-contain" />
         <StyledButton
           onClick={() => {
-            if (isInModal) {
-              window.open('/chat', '_blank')
-            } else {
-              router.visit('/home')
-            }
+            // /chat is served by the admin app itself, so navigate in place rather than
+            // spawning a window. Popping out broke anyone running NOMAD as an installed
+            // web app or in kiosk mode, who then had a stray window to get back out of.
+            router.visit(isInModal ? '/chat' : '/home')
           }}
-          icon={isInModal ? 'IconExternalLink' : 'IconHome'}
+          icon={isInModal ? 'IconArrowRight' : 'IconHome'}
           variant="outline"
           size="sm"
           fullWidth
         >
-          {isInModal ? 'Open in New Tab' : 'Back to Home'}
+          {isInModal ? 'Open Full Chat' : 'Back to Home'}
         </StyledButton>
         <StyledButton
           onClick={() => {
@@ -127,6 +151,17 @@ export default function ChatSidebar({
         >
           Knowledge Base
         </StyledButton>
+        <StyledButton
+          onClick={() => {
+            setIsNomadMdModalOpen(true)
+          }}
+          icon="IconFileDescription"
+          variant="primary"
+          size="sm"
+          fullWidth
+        >
+          NOMAD.md
+        </StyledButton>
         {sessions.length > 0 && (
           <StyledButton
             onClick={onClearHistory}
@@ -142,6 +177,12 @@ export default function ChatSidebar({
       {isKnowledgeBaseModalOpen && (
         <KnowledgeBaseModal aiAssistantName={aiAssistantName} onClose={handleCloseKnowledgeBase} />
       )}
-    </div>
+      {isNomadMdModalOpen && (
+        <NomadMdModal
+          aiAssistantName={aiAssistantName}
+          onClose={() => setIsNomadMdModalOpen(false)}
+        />
+      )}
+    </aside>
   )
 }

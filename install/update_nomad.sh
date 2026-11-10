@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Project N.O.M.A.D. Update Script
+# Project NOMAD Update Script
 
 ###################################################################################################################################################################################################
 
@@ -28,6 +28,11 @@ GREEN='\033[1;32m' # Light Green.
 #                                                                                           Functions                                                                                             #
 #                                                                                                                                                                                                 #
 ###################################################################################################################################################################################################
+
+header_red() {
+  if [[ "${script_option_debug}" != 'true' ]]; then clear; clear; fi
+  echo -e "${RED}#########################################################################${RESET}\\n"
+}
 
 check_has_sudo() {
   if sudo -n true 2>/dev/null; then
@@ -62,7 +67,7 @@ check_is_debian_based() {
 }
 
 get_update_confirmation(){
-  read -p "This script will update Project N.O.M.A.D. and its dependencies on your machine. No data loss is expected, but you should always back up your data before proceeding. Are you sure you want to continue? (y/n): " choice
+  read -p "This script will update Project NOMAD and its dependencies on your machine. No data loss is expected, but you should always back up your data before proceeding. Are you sure you want to continue? (y/n): " choice
   case "$choice" in
     y|Y )
       echo -e "${GREEN}#${RESET} User chose to continue with the update."
@@ -81,26 +86,18 @@ get_update_confirmation(){
 
 ensure_docker_installed_and_running() {
   if ! command -v docker &> /dev/null; then
-    echo -e "${RED}#${RESET} Docker is not installed. This is unexpected, as Project N.O.M.A.D. requires Docker to run. Did you mean to use the install script instead of the update script?"
+    echo -e "${RED}#${RESET} Docker is not installed. This is unexpected, as Project NOMAD requires Docker to run. Did you mean to use the install script instead of the update script?"
     exit 1
   fi
 
-  if grep -qi microsoft /proc/version 2>/dev/null; then
-    # WSL2 — Docker is provided by Docker Desktop, no systemd service
-    if ! docker info &> /dev/null; then
-      echo -e "${RED}#${RESET} Docker is not responding. Please ensure Docker Desktop is running on Windows."
-      exit 1
-    fi
-  else
-    # Native Linux
-    if ! systemctl is-active --quiet docker; then
-      echo -e "${RED}#${RESET} Docker is not running. Attempting to start Docker..."
-      sudo systemctl start docker
-      if ! systemctl is-active --quiet docker; then
-        echo -e "${RED}#${RESET} Failed to start Docker. Please start Docker and try again."
-        exit 1
-      fi
-    fi
+  if docker info >/dev/null 2>&1; then return 0; fi
+  if grep -qi microsoft /proc/version; then
+    echo "Start Docker Desktop on Windows and enable WSL integration for this distribution." >&2
+    exit 1
+  fi
+  if ! sudo systemctl start docker || ! docker info >/dev/null; then
+    echo "Cannot reach the local Docker Engine." >&2
+    exit 1
   fi
 }
 

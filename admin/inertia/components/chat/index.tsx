@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import ChatSidebar from './ChatSidebar'
 import ChatInterface from './ChatInterface'
@@ -7,11 +7,13 @@ import StyledModal from '../StyledModal'
 import api from '~/lib/api'
 import { formatBytes } from '~/lib/util'
 import { useModals } from '~/context/ModalContext'
-import { ChatMessage } from '../../../types/chat'
+import { ChatImageAttachment, ChatMessage } from '../../../types/chat'
 import classNames from '~/lib/classNames'
-import { IconX } from '@tabler/icons-react'
-import { DEFAULT_QUERY_REWRITE_MODEL } from '../../../constants/ollama'
+import { IconMenu2, IconX } from '@tabler/icons-react'
 import { useSystemSetting } from '~/hooks/useSystemSetting'
+import Switch from '~/components/inputs/Switch'
+import InfoTooltip from '~/components/InfoTooltip'
+import { abortActiveStream, clearStreamIfCurrent } from './stream_abort'
 
 interface ChatProps {
   enabled: boolean
@@ -33,10 +35,34 @@ export default function Chat({
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [selectedModel, setSelectedModel] = useState<string>('')
+  const [collectionFilter, setCollectionFilter] = useState<string>('')
   const [pendingModelSwitch, setPendingModelSwitch] = useState<string | null>(null)
   const pageLoadNormalizedRef = useRef(false)
   const [isStreamingResponse, setIsStreamingResponse] = useState(false)
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false)
   const streamAbortRef = useRef<AbortController | null>(null)
+
+  const abortCurrentStream = useCallback(() => {
+    abortActiveStream(streamAbortRef)
+  }, [])
+
+  useEffect(() => () => abortCurrentStream(), [abortCurrentStream])
+
+  useEffect(() => {
+    if (!enabled) {
+      abortCurrentStream()
+      setIsStreamingResponse(false)
+    }
+  }, [enabled, abortCurrentStream])
+
+  useEffect(() => {
+    if (!isMobileSidebarOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsMobileSidebarOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [isMobileSidebarOpen])
 
   // Fetch all sessions
   const { data: sessions = [] } = useQuery({
@@ -57,6 +83,38 @@ export default function Chat({
 
   const { data: lastModelSetting } = useSystemSetting({ key: 'chat.lastModel', enabled })
   const { data: remoteOllamaUrlSetting } = useSystemSetting({ key: 'ai.remoteOllamaUrl', enabled })
+  const { data: autoThinkingSetting } = useSystemSetting({ key: 'ai.autoThinking', enabled })
+  // Global default for models the user hasn't explicitly toggled. Coerce defensively — KV
+  // booleans have historically round-tripped as strings.
+  const autoThinkingDefault =
+    autoThinkingSetting?.value === true || autoThinkingSetting?.value === 'true'
+
+  // Knowledge base retrieval, shared with AI Assistant settings (same KV key).
+  // Unset means on, so coerce off the negative — an absent value must not read
+  // as false.
+  const { data: ragEnabledSetting } = useSystemSetting({ key: 'rag.enabled', enabled })
+  const ragEnabled = !(ragEnabledSetting?.value === false || ragEnabledSetting?.value === 'false')
+
+  const ragEnabledMutation = useMutation({
+    mutationFn: async (value: boolean) => await api.updateSetting('rag.enabled', value),
+    // Flip the switch immediately rather than after the round-trip, and roll
+    // back if the write fails.
+    onMutate: async (value: boolean) => {
+      await queryClient.cancelQueries({ queryKey: ['system-setting', 'rag.enabled'] })
+      const previous = queryClient.getQueryData(['system-setting', 'rag.enabled'])
+      queryClient.setQueryData(['system-setting', 'rag.enabled'], {
+        key: 'rag.enabled',
+        value,
+      })
+      return { previous }
+    },
+    onError: (_err, _value, context) => {
+      queryClient.setQueryData(['system-setting', 'rag.enabled'], context?.previous)
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['system-setting', 'rag.enabled'] })
+    },
+  })
 
   const { data: remoteStatus } = useQuery({
     queryKey: ['remoteOllamaStatus'],
@@ -72,6 +130,46 @@ export default function Chat({
     select: (data) => data || [],
   })
 
+  const { data: knownCollections = [] } = useQuery({
+    queryKey: ['kbCollections'],
+    queryFn: () => api.getKnowledgeCollections(),
+    select: (data) => data?.collections ?? [],
+  })
+
+  // Per-model thinking overrides, remembered client-side (localStorage, keyed by model name).
+  // An entry here means the user explicitly toggled thinking for that model; absent means fall
+  // back to the global default (ai.autoThinking). Seeded from localStorage when models load.
+  const [thinkingOverrides, setThinkingOverrides] = useState<Record<string, boolean>>({})
+  useEffect(() => {
+    const next: Record<string, boolean> = {}
+    for (const m of installedModels) {
+      try {
+        const stored = localStorage.getItem(`nomad:thinking:${m.name}`)
+        if (stored !== null) next[m.name] = stored === 'true'
+      } catch { }
+    }
+    setThinkingOverrides(next)
+  }, [installedModels])
+
+  const selectedModelSupportsThinking =
+    installedModels.find((m) => m.name === selectedModel)?.thinking === true
+  const selectedModelVisionCapability =
+    installedModels.find((m) => m.name === selectedModel)?.vision ?? 'unknown'
+
+  // Effective thinking preference for a model: explicit override wins, else the global default.
+  const effectiveThinking = useCallback(
+    (model: string): boolean =>
+      model in thinkingOverrides ? thinkingOverrides[model] : autoThinkingDefault,
+    [thinkingOverrides, autoThinkingDefault]
+  )
+
+  const setModelThinking = useCallback((model: string, value: boolean) => {
+    setThinkingOverrides((prev) => ({ ...prev, [model]: value }))
+    try {
+      localStorage.setItem(`nomad:thinking:${model}`, String(value))
+    } catch { }
+  }, [])
+
   const { data: chatSuggestions, isLoading: chatSuggestionsLoading } = useQuery<string[]>({
     queryKey: ['chatSuggestions'],
     queryFn: async ({ signal }) => {
@@ -83,13 +181,11 @@ export default function Chat({
     refetchOnMount: false,
   })
 
-  const rewriteModelAvailable = useMemo(() => {
-    return installedModels.some(model => model.name === DEFAULT_QUERY_REWRITE_MODEL)
-  }, [installedModels])
-
   const deleteAllSessionsMutation = useMutation({
     mutationFn: () => api.deleteAllChatSessions(),
     onSuccess: () => {
+      abortCurrentStream()
+      setIsStreamingResponse(false)
       queryClient.invalidateQueries({ queryKey: ['chatSessions'] })
       setActiveSessionId(null)
       setMessages([])
@@ -101,7 +197,10 @@ export default function Chat({
     mutationFn: (request: {
       model: string
       messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+      images?: File[]
       sessionId?: number
+      think?: boolean
+      collection?: string
     }) => api.sendChatMessage({ ...request, stream: false }),
     onSuccess: async (data) => {
       if (!data || !activeSessionId) {
@@ -114,6 +213,7 @@ export default function Chat({
         role: 'assistant',
         content: data.message?.content || 'Sorry, I could not generate a response.',
         timestamp: new Date(),
+        truncated: data.done_reason === 'length',
       }
 
       setMessages((prev) => [...prev, assistantMessage])
@@ -196,6 +296,8 @@ export default function Chat({
     api.unloadChatModels(newModel).catch((err) => {
       console.warn('Failed to unload previous chat model:', err)
     })
+    abortCurrentStream()
+    setIsStreamingResponse(false)
     setSelectedModel(newModel)
     setPendingModelSwitch(null)
     // Clear the active session and messages — the next user message will
@@ -203,7 +305,7 @@ export default function Chat({
     // which already calls api.createChatSession with `selectedModel`.
     setActiveSessionId(null)
     setMessages([])
-  }, [pendingModelSwitch])
+  }, [pendingModelSwitch, abortCurrentStream])
 
   const handleCancelModelSwitch = useCallback(() => {
     setPendingModelSwitch(null)
@@ -211,9 +313,11 @@ export default function Chat({
 
   const handleNewChat = useCallback(() => {
     // Just clear the active session and messages - don't create a session yet
+    abortCurrentStream()
+    setIsStreamingResponse(false)
     setActiveSessionId(null)
     setMessages([])
-  }, [])
+  }, [abortCurrentStream])
 
   const handleClearHistory = useCallback(() => {
     openModal(
@@ -239,6 +343,8 @@ export default function Chat({
     async (sessionId: string) => {
       // Cancel any ongoing suggestions fetch
       queryClient.cancelQueries({ queryKey: ['chatSuggestions'] })
+      abortCurrentStream()
+      setIsStreamingResponse(false)
 
       setActiveSessionId(sessionId)
       // Load messages for this session
@@ -250,6 +356,7 @@ export default function Chat({
             role: m.role,
             content: m.content,
             timestamp: new Date(m.timestamp),
+            sources: m.sources,
           }))
         )
       } else {
@@ -272,39 +379,62 @@ export default function Chat({
         console.warn('Failed to unload non-target chat models on session switch:', err)
       })
     },
-    [installedModels, queryClient, selectedModel]
+    [installedModels, queryClient, selectedModel, abortCurrentStream]
   )
 
   const handleSendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, images: ChatImageAttachment[] = []) => {
       let sessionId = activeSessionId
 
-      // Create a new session if none exists
-      if (!sessionId) {
-        const newSession = await api.createChatSession('New Chat', selectedModel)
-        if (newSession) {
-          sessionId = newSession.id
-          setActiveSessionId(sessionId)
-          queryClient.invalidateQueries({ queryKey: ['chatSessions'] })
-        } else {
-          return
-        }
-      }
-
-      // Add user message to UI
+      // Render the user's message before anything can await (#1211). Creating the
+      // session used to come first, so on a slow or stalled request the message the
+      // user just sent simply did not appear, with no spinner and nothing to retry.
       const userMessage: ChatMessage = {
         id: `msg-${Date.now()}`,
         role: 'user',
         content,
+        images,
         timestamp: new Date(),
       }
 
       setMessages((prev) => [...prev, userMessage])
 
+      // Create a new session if none exists
+      if (!sessionId) {
+        let newSession: Awaited<ReturnType<typeof api.createChatSession>> | undefined
+        try {
+          newSession = await api.createChatSession('New Chat', selectedModel)
+        } catch {
+          newSession = undefined
+        }
+
+        if (!newSession) {
+          // Previously a bare `return`: the message was never rendered and no error
+          // was shown either, so a failed session creation looked like the app
+          // ignoring the user. Surface it the same way a failed response is surfaced.
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `msg-${Date.now()}-error`,
+              role: 'assistant',
+              content: 'Sorry, there was an error starting this chat. Please try again.',
+              timestamp: new Date(),
+            },
+          ])
+          return
+        }
+
+        sessionId = newSession.id
+        setActiveSessionId(sessionId)
+        queryClient.invalidateQueries({ queryKey: ['chatSessions'] })
+      }
+
       const chatMessages = [
         ...messages.map((m) => ({ role: m.role, content: m.content })),
         { role: 'user' as const, content },
       ]
+
+      abortCurrentStream()
 
       if (streamingEnabled !== false) {
         // Streaming path
@@ -323,7 +453,14 @@ export default function Chat({
 
         try {
           await api.streamChatMessage(
-            { model: selectedModel || 'llama3.2', messages: chatMessages, stream: true, sessionId: sessionId ? Number(sessionId) : undefined },
+            {
+              model: selectedModel || 'llama3.2',
+              messages: chatMessages,
+              stream: true,
+              sessionId: sessionId ? Number(sessionId) : undefined, think: effectiveThinking(selectedModel),
+              collection: collectionFilter || undefined,
+              images: images.map((image) => image.file),
+            },
             (chunkContent, chunkThinking, done) => {
               if (chunkThinking.length > 0 && thinkingStartTime === null) {
                 thinkingStartTime = Date.now()
@@ -348,7 +485,10 @@ export default function Chat({
                 if (isThinkingPhase && chunkContent.length > 0) {
                   isThinkingPhase = false
                   if (thinkingStartTime !== null) {
-                    thinkingDuration = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000))
+                    thinkingDuration = Math.max(
+                      1,
+                      Math.round((Date.now() - thinkingStartTime) / 1000)
+                    )
                   }
                 }
                 setMessages((prev) =>
@@ -369,39 +509,50 @@ export default function Chat({
               fullContent += chunkContent
               thinkingContent += chunkThinking
             },
-            abortController.signal
+            abortController.signal,
+            (sources) => {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === assistantMsgId ? { ...m, sources } : m))
+              )
+            },
+            (reason) => {
+              if (reason !== 'length') return
+              setMessages((prev) =>
+                prev.map((m) => (m.id === assistantMsgId ? { ...m, truncated: true } : m))
+              )
+            }
           )
         } catch (error: any) {
           if (error?.name !== 'AbortError') {
             setMessages((prev) => {
               const hasAssistantMsg = prev.some((m) => m.id === assistantMsgId)
               if (hasAssistantMsg) {
-                return prev.map((m) =>
-                  m.id === assistantMsgId ? { ...m, isStreaming: false } : m
-                )
+                return prev.map((m) => (m.id === assistantMsgId ? { ...m, isStreaming: false } : m))
               }
               return [
                 ...prev,
                 {
                   id: assistantMsgId,
                   role: 'assistant',
-                  content: 'Sorry, there was an error processing your request. Please try again.',
+                  content:
+                    error instanceof Error
+                      ? error.message
+                      : 'Sorry, there was an error processing your request. Please try again.',
                   timestamp: new Date(),
                 },
               ]
             })
           }
         } finally {
-          setIsStreamingResponse(false)
-          streamAbortRef.current = null
+          if (clearStreamIfCurrent(streamAbortRef, abortController)) {
+            setIsStreamingResponse(false)
+          }
         }
 
         if (fullContent && sessionId) {
           // Ensure the streaming cursor is removed
           setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantMsgId ? { ...m, isStreaming: false } : m
-            )
+            prev.map((m) => (m.id === assistantMsgId ? { ...m, isStreaming: false } : m))
           )
 
           // Refresh sessions to pick up backend-persisted messages and title
@@ -414,111 +565,185 @@ export default function Chat({
           model: selectedModel || 'llama3.2',
           messages: chatMessages,
           sessionId: sessionId ? Number(sessionId) : undefined,
+          think: effectiveThinking(selectedModel),
+          collection: collectionFilter || undefined,
+          images: images.map((image) => image.file),
         })
       }
     },
-    [activeSessionId, messages, selectedModel, chatMutation, queryClient, streamingEnabled]
+    [activeSessionId, messages, selectedModel, collectionFilter, chatMutation, queryClient, streamingEnabled, effectiveThinking, abortCurrentStream]
   )
 
   return (
     <>
-    {pendingModelSwitch && (
-      <StyledModal
-        title={`Switch to ${pendingModelSwitch}?`}
-        onConfirm={handleConfirmModelSwitch}
-        onCancel={handleCancelModelSwitch}
-        open={true}
-        confirmText="Switch & New Chat"
-        cancelText="Cancel"
-        confirmVariant="primary"
-      >
-        <p className="text-text-primary">
-          Switching to <strong>{pendingModelSwitch}</strong> will start a new chat. Your current
-          conversation stays available in the sidebar.
-        </p>
-      </StyledModal>
-    )}
-    <div
-      className={classNames(
-        'flex border border-border-subtle overflow-hidden shadow-sm w-full',
-        isInModal ? 'h-full rounded-lg' : 'h-screen'
+      {pendingModelSwitch && (
+        <StyledModal
+          title={`Switch to ${pendingModelSwitch}?`}
+          onConfirm={handleConfirmModelSwitch}
+          onCancel={handleCancelModelSwitch}
+          open={true}
+          confirmText="Switch & New Chat"
+          cancelText="Cancel"
+          confirmVariant="primary"
+        >
+          <p className="text-text-primary">
+            Switching to <strong>{pendingModelSwitch}</strong> will start a new chat. Your current
+            conversation stays available in the sidebar.
+          </p>
+        </StyledModal>
       )}
-    >
-      <ChatSidebar
-        sessions={sessions}
-        activeSessionId={activeSessionId}
-        onSessionSelect={handleSessionSelect}
-        onNewChat={handleNewChat}
-        onClearHistory={handleClearHistory}
-        isInModal={isInModal}
-      />
-      <div className="flex-1 flex flex-col min-h-0">
-        <KbPolicyPromptBanner />
-        <div className="px-6 py-3 border-b border-border-subtle bg-surface-secondary flex items-center justify-between h-[75px] flex-shrink-0">
-          <h2 className="text-lg font-semibold text-text-primary">
-            {activeSession?.title || 'New Chat'}
-          </h2>
-          <div className="flex items-center gap-4">
-            {remoteOllamaUrlSetting?.value && (
-              <span
-                className={classNames(
-                  'text-xs rounded px-2 py-1 font-medium',
-                  remoteStatus?.connected === false
-                    ? 'text-red-700 bg-red-50 border border-red-200'
-                    : 'text-green-700 bg-green-50 border border-green-200'
-                )}
+      <div
+        className={classNames(
+          'flex border border-border-subtle overflow-hidden shadow-sm w-full',
+          isInModal ? 'h-full rounded-lg' : 'h-screen'
+        )}
+      >
+        <ChatSidebar
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          onSessionSelect={handleSessionSelect}
+          onNewChat={handleNewChat}
+          onClearHistory={handleClearHistory}
+          isInModal={isInModal}
+          isMobileOpen={isMobileSidebarOpen}
+          onMobileClose={() => setIsMobileSidebarOpen(false)}
+        />
+        {isMobileSidebarOpen && (
+          <button
+            type="button"
+            aria-label="Close conversation sidebar"
+            className="fixed inset-0 z-40 bg-black/40 md:hidden"
+            onClick={() => setIsMobileSidebarOpen(false)}
+          />
+        )}
+        <div className="flex-1 flex flex-col min-h-0 min-w-0">
+          <KbPolicyPromptBanner />
+          <div className="px-3 sm:px-6 py-3 border-b border-border-subtle bg-surface-secondary flex flex-wrap items-center justify-between gap-2 min-h-[75px] flex-shrink-0">
+            <div className="flex items-center gap-2 min-w-0">
+              <button
+                type="button"
+                className="rounded-lg p-1.5 hover:bg-surface-primary focus:outline-none focus:ring-2 focus:ring-desert-green md:hidden"
+                aria-label="Open conversation sidebar"
+                aria-controls="chat-sidebar"
+                aria-expanded={isMobileSidebarOpen}
+                onClick={() => setIsMobileSidebarOpen(true)}
               >
-                {remoteStatus?.connected === false ? 'Remote Disconnected' : 'Remote Connected'}
-              </span>
-            )}
-            <div className="flex items-center gap-2">
-              <label htmlFor="model-select" className="text-sm text-text-secondary">
-                Model:
-              </label>
-              {isLoadingModels ? (
-                <div className="text-sm text-text-muted">Loading models...</div>
-              ) : installedModels.length === 0 ? (
-                <div className="text-sm text-red-600">No models installed</div>
-              ) : (
-                <select
-                  id="model-select"
-                  value={pendingModelSwitch ?? selectedModel}
-                  onChange={(e) => handleUserSelectedModel(e.target.value)}
-                  className="px-3 py-1.5 border border-border-default rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-desert-green focus:border-transparent bg-surface-primary"
+                <IconMenu2 className="h-6 w-6 text-text-muted" aria-hidden="true" />
+              </button>
+              <h2 className="text-lg font-semibold text-text-primary truncate">
+                {activeSession?.title || 'New Chat'}
+              </h2>
+            </div>
+            <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+              {remoteOllamaUrlSetting?.value && (
+                <span
+                  className={classNames(
+                    'text-xs rounded px-2 py-1 font-medium',
+                    remoteStatus?.connected === false
+                      ? 'text-red-700 bg-red-50 border border-red-200'
+                      : 'text-green-700 bg-green-50 border border-green-200'
+                  )}
                 >
-                  {installedModels.map((model) => (
-                    <option key={model.name} value={model.name}>
-                      {model.name}{model.size > 0 ? ` (${formatBytes(model.size)})` : ''}
-                    </option>
-                  ))}
-                </select>
+                  {remoteStatus?.connected === false ? 'Remote Disconnected' : 'Remote Connected'}
+                </span>
+              )}
+              {ragEnabled && (
+                <div className="flex items-center gap-2">
+                  <label htmlFor="collection-select" className="text-sm text-text-secondary">
+                    Search in:
+                  </label>
+                  <select
+                    id="collection-select"
+                    value={collectionFilter}
+                    onChange={(e) => setCollectionFilter(e.target.value)}
+                    className="px-3 py-1.5 border border-border-default rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-desert-green focus:border-transparent bg-surface-primary"
+                  >
+                    <option value="">All</option>
+                    {knownCollections.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div className="flex items-center gap-2 min-w-0">
+                <label htmlFor="model-select" className="text-sm text-text-secondary">
+                  Model:
+                </label>
+                {isLoadingModels ? (
+                  <div className="text-sm text-text-muted">Loading models...</div>
+                ) : installedModels.length === 0 ? (
+                  <div className="text-sm text-red-600">No models installed</div>
+                ) : (
+                  <select
+                    id="model-select"
+                    value={pendingModelSwitch ?? selectedModel}
+                    onChange={(e) => handleUserSelectedModel(e.target.value)}
+                    className="min-w-0 max-w-44 sm:max-w-none px-2 sm:px-3 py-1.5 border border-border-default rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-desert-green focus:border-transparent bg-surface-primary"
+                  >
+                    {installedModels.map((model) => (
+                      <option key={model.name} value={model.name}>
+                        {model.name}
+                        {model.size > 0 ? ` (${formatBytes(model.size)})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              <div className="flex items-center">
+                <span className="text-sm text-text-secondary select-none">Knowledge Base:</span>
+                <InfoTooltip
+                  position="bottom"
+                  align="right"
+                  text="When on, the assistant searches your knowledge base for relevant documents before answering. Turning this off is faster and lighter on hardware, which helps when your knowledge base is small or empty. This is the same setting as in AI Assistant settings."
+                />
+                <Switch
+                  id="chat-rag-toggle"
+                  checked={ragEnabled}
+                  onChange={(v) => ragEnabledMutation.mutate(v)}
+                />
+              </div>
+              {selectedModelSupportsThinking && (
+                <div className="flex items-center">
+                  <span className="text-sm text-text-secondary select-none">Thinking:</span>
+                  <InfoTooltip
+                    position="bottom"
+                    align="right"
+                    text="When on, this model works through its reasoning before answering. Slower, but often better on tricky questions. Your choice is remembered for this model; the default for other models is set in AI Assistant settings."
+                  />
+                  <Switch
+                    id="chat-thinking-toggle"
+                    checked={effectiveThinking(selectedModel)}
+                    onChange={(v) => setModelThinking(selectedModel, v)}
+                  />
+                </div>
+              )}
+              {isInModal && (
+                <button
+                  type="button"
+                  aria-label="Close chat"
+                  onClick={() => {
+                    if (onClose) {
+                      onClose()
+                    }
+                  }}
+                  className="rounded-lg hover:bg-surface-secondary transition-colors"
+                >
+                  <IconX className="h-6 w-6 text-text-muted" aria-hidden="true" />
+                </button>
               )}
             </div>
-            {isInModal && (
-              <button
-                onClick={() => {
-                  if (onClose) {
-                    onClose()
-                  }
-                }}
-                className="rounded-lg hover:bg-surface-secondary transition-colors"
-              >
-                <IconX className="h-6 w-6 text-text-muted" />
-              </button>
-            )}
           </div>
+          <ChatInterface
+            messages={messages}
+            onSendMessage={handleSendMessage}
+            visionCapability={selectedModelVisionCapability}
+            isLoading={isStreamingResponse || chatMutation.isPending}
+            chatSuggestions={chatSuggestions}
+            chatSuggestionsEnabled={suggestionsEnabled}
+            chatSuggestionsLoading={chatSuggestionsLoading}
+          />
         </div>
-        <ChatInterface
-          messages={messages}
-          onSendMessage={handleSendMessage}
-          isLoading={isStreamingResponse || chatMutation.isPending}
-          chatSuggestions={chatSuggestions}
-          chatSuggestionsEnabled={suggestionsEnabled}
-          chatSuggestionsLoading={chatSuggestionsLoading}
-          rewriteModelAvailable={rewriteModelAvailable}
-        />
       </div>
-    </div>
     </>
   )
 }

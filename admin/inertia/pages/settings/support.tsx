@@ -5,7 +5,7 @@ import SettingsLayout from '~/layouts/SettingsLayout'
 export default function SupportPage() {
   return (
     <SettingsLayout>
-      <Head title="Support the Project | Project N.O.M.A.D." />
+      <Head title="Support the Project | Project NOMAD" />
       <div className="xl:pl-72 w-full">
         <main className="px-12 py-6 max-w-4xl">
           <h1 className="text-4xl font-semibold mb-4">Support the Project</h1>
@@ -103,11 +103,11 @@ export default function SupportPage() {
             </ul>
           </section>
 
-          {/* WSL2 Fork */}
+          {/* Fork support */}
           <section className="mb-10 p-5 rounded-lg border border-desert-stone-light bg-desert-stone-lighter/30">
             <h2 className="text-2xl font-semibold mb-3">About This Build</h2>
             <p className="text-text-muted mb-4">
-              You're running the unofficial <strong>WSL2 + Docker Desktop</strong> fork of Project N.O.M.A.D.,
+              You're running the unofficial <strong>WSL2 and ARM64 Linux</strong> fork of Project N.O.M.A.D.,
               maintained by{' '}
               <a
                 href="https://github.com/BigMoonTech"
@@ -125,7 +125,7 @@ export default function SupportPage() {
               >
                 Crosstalk Solutions
               </a>
-              {' '}targets Debian/Ubuntu only — this fork adds Windows support.
+              {' '}provides the core Command Center.
             </p>
             <ul className="space-y-2 text-text-muted">
               <li>
@@ -135,9 +135,9 @@ export default function SupportPage() {
                   rel="noopener noreferrer"
                   className="text-blue-600 hover:underline"
                 >
-                  Report Windows/WSL2-specific bugs
+                  Report fork-specific bugs
                 </a>
-                {' '}— for issues unique to running on WSL2 + Docker Desktop
+                {' '}— for issues on WSL2 + Docker Desktop or native ARM64 Docker Engine
               </li>
               <li>
                 <a

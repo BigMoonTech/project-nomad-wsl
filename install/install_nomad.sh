@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Project N.O.M.A.D. Installation Script
+# Project NOMAD Installation Script
 
 ###################################################################################################################################################################################################
 
@@ -29,7 +29,7 @@ GREEN='\033[1;32m' # Light Green.
 #                                                                                                                                                                                                 #
 ###################################################################################################################################################################################################
 
-WHIPTAIL_TITLE="Project N.O.M.A.D Installation"
+WHIPTAIL_TITLE="Project NOMAD Installation"
 NOMAD_DIR="/opt/project-nomad"
 IS_WSL=false
 if grep -qi microsoft /proc/version 2>/dev/null; then
@@ -57,6 +57,22 @@ header() {
 header_red() {
   if [[ "${script_option_debug}" != 'true' ]]; then clear; clear; fi
   echo -e "${RED}#########################################################################${RESET}\\n"
+}
+
+banner() {
+  echo ""
+  echo -e "${GREEN}"
+  cat <<'NOMAD_ART'
+                             P R O J E C T
+                    _   _  ___  __  __    _    ____
+                   | \ | |/ _ \|  \/  |  / \  |  _ \
+                   |  \| | | | | |\/| | / _ \ | | | |
+                   | |\  | |_| | |  | |/ ___ \| |_| |
+                   |_| \_|\___/|_|  |_/_/   \_\____/
+NOMAD_ART
+  echo -e "${RESET}"
+  echo -e "${WHITE_R}                 Offline knowledge and education server${RESET}\n"
+  echo -e "${GREEN}#########################################################################${RESET}\n"
 }
 
 check_has_sudo() {
@@ -91,19 +107,13 @@ check_is_debian_based() {
     echo -e "${GREEN}#${RESET} This script is running on a Debian-based system.\\n"
 }
 
-check_is_x86_64() {
+check_architecture() {
   local arch
   arch="$(uname -m)"
-  if [[ "${arch}" != "x86_64" && "${arch}" != "amd64" ]]; then
-    echo -e "${YELLOW}#${RESET} WARNING: Detected architecture '${arch}'. NOMAD officially supports x86_64 only.\\n"
-    echo -e "${YELLOW}#${RESET} ARM64/aarch64 support is tracked in PR #419 and is not yet ready.\\n"
-    echo -e "${YELLOW}#${RESET} Continuing on an unsupported architecture will likely fail and may leave\\n"
-    echo -e "${YELLOW}#${RESET} partial Docker images and files behind that you'll need to clean up manually.\\n"
-    echo -e "${YELLOW}#${RESET} Continuing in 10 seconds... press Ctrl+C now to abort.\\n"
-    sleep 10
-    return
-  fi
-  echo -e "${GREEN}#${RESET} Architecture check passed (${arch}).\\n"
+  case "$arch" in
+    x86_64|amd64|aarch64|arm64) echo -e "${GREEN}#${RESET} Architecture check passed (${arch})." ;;
+    *) echo -e "${RED}#${RESET} Unsupported architecture '${arch}'. NOMAD requires x86-64 or ARM64 Linux." >&2; exit 1 ;;
+  esac
 }
 
 ensure_dependencies_installed() {
@@ -162,92 +172,81 @@ generateRandomPass() {
 }
 
 ensure_docker_installed() {
-  if ! command -v docker &> /dev/null; then
+  if ! command -v docker >/dev/null; then
     if $IS_WSL; then
-      echo -e "${RED}#${RESET} Docker not found in WSL2. Please ensure Docker Desktop is installed on Windows"
-      echo -e "${RED}#${RESET} and WSL2 integration is enabled for this distro."
-      echo -e "${RED}#${RESET} Docker Desktop > Settings > Resources > WSL Integration > Enable for this distro"
-      exit 1
+      echo "Install Docker Desktop on Windows and enable WSL integration for this distribution." >&2
+      return 1
     fi
-
-    echo -e "${YELLOW}#${RESET} Docker not found. Installing Docker...\\n"
-
-    # Update package database
-    sudo apt-get update
-
-    # Install prerequisites
-    sudo apt-get install -y ca-certificates curl
-
-    # Create directory for keyrings
-    # sudo install -m 0755 -d /etc/apt/keyrings
-
-    # # Download Docker's official GPG key
-    # sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
-    # sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-    # # Add the repository to Apt sources
-    # echo \
-    #   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
-    #   $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-    #   sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    # # Update the package database with the Docker packages from the newly added repo
-    # sudo apt-get update
-
-    # # Install Docker packages
-    # sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-    # Download the Docker convenience script
-    curl -fsSL https://get.docker.com -o get-docker.sh
-
-    # Run the Docker installation script
-    sudo sh get-docker.sh
-
-    # Check if Docker was installed successfully
-    if ! command -v docker &> /dev/null; then
-      echo -e "${RED}#${RESET} Docker installation failed. Please check the logs and try again."
-      exit 1
+    local script
+    script=$(mktemp) || return 1
+    if ! curl -fsSL --retry 3 https://get.docker.com -o "$script" || ! sudo sh "$script"; then
+      rm -f "$script"
+      echo "Docker Engine installation failed." >&2
+      return 1
     fi
+    rm -f "$script"
+  fi
 
-    echo -e "${GREEN}#${RESET} Docker installation completed.\\n"
-  else
-    echo -e "${GREEN}#${RESET} Docker is already installed.\\n"
-
-    # Check if Docker is responsive
+  # All production bind mounts resolve on the local engine. Check the actual
+  # socket used by Command Center before installing anything into /opt.
+  local engine
+  if ! engine=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null); then
     if $IS_WSL; then
-      # On WSL2, Docker is provided by Docker Desktop — no systemd service to check.
-      # Just verify the daemon is reachable.
-      if ! docker info &> /dev/null; then
-        echo -e "${RED}#${RESET} Docker is installed but not responding. Please ensure Docker Desktop is running on Windows."
-        exit 1
-      fi
-      echo -e "${GREEN}#${RESET} Docker Desktop (WSL2 integration) is running.\\n"
-    else
-      # Native Linux — check via systemctl
-      if ! systemctl is-active --quiet docker; then
-        echo -e "${YELLOW}#${RESET} Docker is installed but not running. Attempting to start Docker...\\n"
-        sudo systemctl start docker
-        if ! systemctl is-active --quiet docker; then
-          echo -e "${RED}#${RESET} Failed to start Docker. Please check the Docker service status and try again."
-          exit 1
-        else
-          echo -e "${GREEN}#${RESET} Docker service started successfully.\\n"
-        fi
-      else
-        echo -e "${GREEN}#${RESET} Docker service is already running.\\n"
-      fi
+      echo "Start Docker Desktop on Windows and enable WSL integration for this distribution." >&2
+      return 1
+    fi
+    if ! sudo systemctl start docker || ! engine=$(docker info --format '{{.OperatingSystem}}'); then
+      echo "The Docker CLI is installed but cannot reach the local Docker Engine." >&2
+      return 1
     fi
   fi
+  if [[ $(docker info --format '{{.OSType}}') != linux ]]; then
+    echo "NOMAD requires Linux containers. Switch Docker Desktop to its Linux engine." >&2
+    return 1
+  fi
+  local socket_id
+  socket_id=$(docker --host unix:///var/run/docker.sock info --format '{{.ID}}') || return 1
+  if [[ -z "$socket_id" || "$socket_id" != "$(docker info --format '{{.ID}}')" ]]; then
+    echo "Select the local engine that provides /var/run/docker.sock. NOMAD uses this socket and local bind mounts." >&2
+    return 1
+  fi
+  if ! $IS_WSL && [[ "$engine" == *"Docker Desktop"* ]]; then
+    echo "Select the native Docker Engine on Linux (docker context use default), then rerun the installer." >&2
+    return 1
+  fi
+  if $IS_WSL && [[ "$engine" != *"Docker Desktop"* ]]; then
+    echo "Enable Docker Desktop's WSL integration and select its engine in this distribution." >&2
+    return 1
+  fi
+  local daemon_arch
+  daemon_arch=$(docker info --format '{{.Architecture}}')
+  case "$daemon_arch" in
+    x86_64|amd64) export DOCKER_DEFAULT_PLATFORM=linux/amd64 ;;
+    aarch64|arm64) export DOCKER_DEFAULT_PLATFORM=linux/arm64 ;;
+    *) echo "Unsupported Docker Engine architecture: $daemon_arch" >&2; return 1 ;;
+  esac
+  echo "Connected to $engine. Installing $DOCKER_DEFAULT_PLATFORM images."
 }
 
 check_docker_compose() {
-  # Check if 'docker compose' (v2 plugin) is available
-  if ! docker compose version &>/dev/null; then
-    echo -e "${RED}#${RESET} Docker Compose v2 is not installed or not available as a Docker plugin."
-    echo -e "${YELLOW}#${RESET} This script requires 'docker compose' (v2), not 'docker-compose' (v1)."
-    echo -e "${YELLOW}#${RESET} Please read the Docker documentation at https://docs.docker.com/compose/install/ for instructions on how to install Docker Compose v2."
-    exit 1
+  if docker compose version >/dev/null 2>&1; then return 0; fi
+  if $IS_WSL; then
+    echo "Enable or update Docker Desktop's Compose plugin for this WSL distribution." >&2
+    return 1
   fi
+  sudo apt-get update || return 1
+  local package
+  for package in docker-compose-plugin docker-compose-v2; do
+    if apt-cache show "$package" >/dev/null 2>&1 && sudo apt-get install -y "$package" && docker compose version >/dev/null; then
+      return 0
+    fi
+  done
+  echo "Install the Docker Compose plugin for your Docker Engine, then rerun the installer." >&2
+  return 1
+}
+
+docker_has_nvidia_runtime() {
+  [[ $(docker info --format '{{if index .Runtimes "nvidia"}}yes{{end}}' 2>/dev/null) == yes ]]
 }
 
 setup_nvidia_container_toolkit() {
@@ -269,7 +268,7 @@ setup_nvidia_container_toolkit() {
   # Safely detect NVIDIA GPU
   local has_nvidia_gpu=false
   if command -v lspci &> /dev/null; then
-    if lspci 2>/dev/null | grep -i nvidia &> /dev/null; then
+    if lspci 2>/dev/null | grep -Ei 'VGA|3D controller|Display controller' | grep -qi nvidia; then
       has_nvidia_gpu=true
       echo -e "${GREEN}#${RESET} NVIDIA GPU detected.\\n"
     fi
@@ -288,80 +287,48 @@ setup_nvidia_container_toolkit() {
     return 0
   fi
 
-  # Check if nvidia-container-toolkit is already installed
-  if command -v nvidia-ctk &> /dev/null; then
-    echo -e "${GREEN}#${RESET} NVIDIA container toolkit is already installed.\\n"
+  # A preconfigured DGX Spark already exposes the NVIDIA runtime.
+  if docker_has_nvidia_runtime; then
+    echo "Docker already provides the NVIDIA runtime."
     return 0
   fi
 
-  echo -e "${YELLOW}#${RESET} Installing NVIDIA container toolkit...\\n"
+  # Install only when the toolkit itself is missing.
+  if ! command -v nvidia-ctk >/dev/null; then
+    echo -e "${YELLOW}#${RESET} Installing NVIDIA container toolkit...\\n"
 
-  # Install dependencies per https://docs.ollama.com/docker - wrapped in error handling
-  if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null; then
-    echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit GPG key. Continuing anyway...\\n"
-    return 0
+    # Install dependencies per https://docs.ollama.com/docker - wrapped in error handling
+    if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null; then
+      echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit GPG key. Continuing anyway...\\n"
+      return 0
+    fi
+
+    if ! curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list 2>/dev/null \
+        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1; then
+      echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit repository. Continuing anyway...\\n"
+      return 0
+    fi
+
+    if ! sudo apt-get update 2>/dev/null; then
+      echo -e "${YELLOW}#${RESET} Warning: Failed to update package list. Continuing anyway...\\n"
+      return 0
+    fi
+
+    if ! sudo apt-get install -y nvidia-container-toolkit 2>/dev/null; then
+      echo -e "${YELLOW}#${RESET} Warning: Failed to install NVIDIA container toolkit. Continuing anyway...\\n"
+      return 0
+    fi
+
+    echo -e "${GREEN}#${RESET} NVIDIA container toolkit installed successfully.\\n"
   fi
-
-  if ! curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list 2>/dev/null \
-      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-      | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1; then
-    echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit repository. Continuing anyway...\\n"
-    return 0
-  fi
-
-  if ! sudo apt-get update 2>/dev/null; then
-    echo -e "${YELLOW}#${RESET} Warning: Failed to update package list. Continuing anyway...\\n"
-    return 0
-  fi
-
-  if ! sudo apt-get install -y nvidia-container-toolkit 2>/dev/null; then
-    echo -e "${YELLOW}#${RESET} Warning: Failed to install NVIDIA container toolkit. Continuing anyway...\\n"
-    return 0
-  fi
-
-  echo -e "${GREEN}#${RESET} NVIDIA container toolkit installed successfully.\\n"
 
   # Configure Docker to use NVIDIA runtime
   echo -e "${YELLOW}#${RESET} Configuring Docker to use NVIDIA runtime...\\n"
 
-  if ! sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null; then
-    echo -e "${YELLOW}#${RESET} nvidia-ctk configure failed, attempting manual configuration...\\n"
-
-    # Fallback: Manually configure daemon.json
-    local daemon_json="/etc/docker/daemon.json"
-    local config_success=false
-
-    if [[ -f "$daemon_json" ]]; then
-      # Backup existing config (best effort)
-      sudo cp "$daemon_json" "${daemon_json}.backup" 2>/dev/null || true
-
-      # Check if nvidia runtime already exists
-      if ! grep -q '"nvidia"' "$daemon_json" 2>/dev/null; then
-        # Add nvidia runtime to existing config using jq if available
-        if command -v jq &> /dev/null; then
-          if sudo jq '. + {"runtimes": {"nvidia": {"path": "nvidia-container-runtime", "runtimeArgs": []}}}' "$daemon_json" > /tmp/daemon.json.tmp 2>/dev/null; then
-            if sudo mv /tmp/daemon.json.tmp "$daemon_json" 2>/dev/null; then
-              config_success=true
-            fi
-          fi
-          # Clean up temp file if move failed
-          sudo rm -f /tmp/daemon.json.tmp 2>/dev/null || true
-        else
-          echo -e "${YELLOW}#${RESET} jq not available, skipping manual daemon.json configuration...\\n"
-        fi
-      else
-        config_success=true  # Already configured
-      fi
-    else
-      # Create new daemon.json with nvidia runtime (best effort)
-      if echo '{"runtimes":{"nvidia":{"path":"nvidia-container-runtime","runtimeArgs":[]}}}' | sudo tee "$daemon_json" > /dev/null 2>&1; then
-        config_success=true
-      fi
-    fi
-
-    if ! $config_success; then
-      echo -e "${YELLOW}#${RESET} Manual daemon.json configuration unsuccessful. GPU support may require manual setup.\\n"
-    fi
+  if ! sudo nvidia-ctk runtime configure --runtime=docker; then
+    echo "NVIDIA runtime configuration failed. Continuing with CPU support." >&2
+    return 0
   fi
 
   # Restart Docker service
@@ -375,7 +342,7 @@ setup_nvidia_container_toolkit() {
   echo -e "${YELLOW}#${RESET} Verifying NVIDIA runtime configuration...\\n"
   sleep 2  # Give Docker a moment to fully restart
 
-  if docker info 2>/dev/null | grep -q "nvidia"; then
+  if docker_has_nvidia_runtime; then
     echo -e "${GREEN}#${RESET} NVIDIA runtime successfully configured and verified.\\n"
   else
     echo -e "${YELLOW}#${RESET} Warning: NVIDIA runtime not detected in Docker info. GPU acceleration may not work.\\n"
@@ -414,8 +381,8 @@ setup_nvidia_wsl2() {
   fi
 
   # Verify Docker Desktop exposes the NVIDIA runtime
-  if docker info 2>/dev/null | grep -qi nvidia; then
-    echo -e "${GREEN}#${RESET} Docker Desktop NVIDIA runtime is available. GPU acceleration is ready.\\n"
+  if docker_has_nvidia_runtime; then
+    echo -e "${GREEN}#${RESET} Docker Desktop advertises the NVIDIA runtime.\\n"
   else
     echo -e "${YELLOW}#${RESET} NVIDIA GPU is present but Docker Desktop does not show the NVIDIA runtime.\\n"
     echo -e "${YELLOW}#${RESET} Please check the following:\\n"
@@ -430,8 +397,11 @@ setup_nvidia_wsl2() {
 }
 
 get_install_confirmation(){
-  echo -e "${YELLOW}#${RESET} This script will install Project N.O.M.A.D. and its dependencies on your machine."
-  echo -e "${YELLOW}#${RESET} If you already have Project N.O.M.A.D. installed with customized config or data, please be aware that running this installation script may overwrite existing files and configurations. It is highly recommended to back up any important data/configs before proceeding."
+  echo -e "${YELLOW}#${RESET} This script will install Project NOMAD and its dependencies on your machine."
+  if [[ -e "${NOMAD_DIR}/compose.yml" || -d "${NOMAD_DIR}/mysql" ]]; then
+    echo -e "${RED}#${RESET} Found an existing installation at ${NOMAD_DIR}. Use Settings → Check for Updates or the existing update script." >&2
+    exit 1
+  fi
   read -p "Are you sure you want to continue? (y/N): " choice
   case "$choice" in
     y|Y )
@@ -449,9 +419,9 @@ accept_terms() {
   echo "License Agreement & Terms of Use"
   echo "__________________________"
   printf "\n\n"
-  echo "Project N.O.M.A.D. is licensed under the Apache License 2.0. The full license can be found at https://www.apache.org/licenses/LICENSE-2.0 or in the LICENSE file of this repository."
+  echo "Project NOMAD is licensed under the Apache License 2.0. The full license can be found at https://www.apache.org/licenses/LICENSE-2.0 or in the LICENSE file of this repository."
   printf "\n"
-  echo "By accepting this agreement, you acknowledge that you have read and understood the terms and conditions of the Apache License 2.0 and agree to be bound by them while using Project N.O.M.A.D."
+  echo "By accepting this agreement, you acknowledge that you have read and understood the terms and conditions of the Apache License 2.0 and agree to be bound by them while using Project NOMAD"
   echo -e "\n\n"
   read -p "I have read and accept License Agreement & Terms of Use (y/N)? " choice
   case "$choice" in
@@ -468,7 +438,7 @@ accept_terms() {
 create_nomad_directory(){
   # Ensure the main installation directory exists
   if [[ ! -d "$NOMAD_DIR" ]]; then
-    echo -e "${YELLOW}#${RESET} Creating directory for Project N.O.M.A.D at $NOMAD_DIR...\\n"
+    echo -e "${YELLOW}#${RESET} Creating directory for Project NOMAD at $NOMAD_DIR...\\n"
     sudo mkdir -p "$NOMAD_DIR"
     sudo chown "$(whoami):$(whoami)" "$NOMAD_DIR"
 
@@ -485,7 +455,8 @@ create_nomad_directory(){
 }
 
 download_management_compose_file() {
-  local compose_file_path="${NOMAD_DIR}/compose.yml"
+  local compose_file_path
+  compose_file_path=$(mktemp "${NOMAD_DIR}/.compose.XXXXXX") || return 1
 
   echo -e "${YELLOW}#${RESET} Downloading docker-compose file for management...\\n"
   if ! curl -fsSL "$MANAGEMENT_COMPOSE_FILE_URL" -o "$compose_file_path"; then
@@ -497,15 +468,6 @@ download_management_compose_file() {
   local app_key=$(generateRandomPass)
   local db_root_password=$(generateRandomPass)
   local db_user_password=$(generateRandomPass)
-
-  # If MySQL data directory exists from a previous install attempt, remove it.
-  # MySQL only initializes credentials on first startup when the data dir is empty.
-  # If stale data exists, MySQL ignores the new passwords above and uses the old ones,
-  # causing "Access denied" errors when the admin container tries to connect.
-  if [[ -d "${NOMAD_DIR}/mysql" ]]; then
-    echo -e "${YELLOW}#${RESET} Removing existing MySQL data directory to ensure credentials match...\\n"
-    sudo rm -rf "${NOMAD_DIR}/mysql"
-  fi
 
   # Inject dynamic env values into the compose file
   echo -e "${YELLOW}#${RESET} Configuring docker-compose file env variables...\\n"
@@ -524,6 +486,8 @@ download_management_compose_file() {
     sed -i 's|/:/host:ro,rslave|/:/host:ro|' "$compose_file_path"
   fi
 
+  docker compose -f "$compose_file_path" config --quiet || { rm -f "$compose_file_path"; return 1; }
+  mv "$compose_file_path" "${NOMAD_DIR}/compose.yml" || return 1
   echo -e "${GREEN}#${RESET} Docker compose file configured successfully.\\n"
 }
 
@@ -533,19 +497,19 @@ download_helper_scripts() {
   local update_script_path="${NOMAD_DIR}/update_nomad.sh"
 
   echo -e "${YELLOW}#${RESET} Downloading helper scripts...\\n"
-  if ! curl -fsSL "$START_SCRIPT_URL" -o "$start_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$START_SCRIPT_URL" -o "$start_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the start script. Please check the URL and try again."
     exit 1
   fi
   chmod +x "$start_script_path"
 
-  if ! curl -fsSL "$STOP_SCRIPT_URL" -o "$stop_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$STOP_SCRIPT_URL" -o "$stop_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the stop script. Please check the URL and try again."
     exit 1
   fi
   chmod +x "$stop_script_path"
 
-  if ! curl -fsSL "$UPDATE_SCRIPT_URL" -o "$update_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$UPDATE_SCRIPT_URL" -o "$update_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the update script. Please check the URL and try again."
     exit 1
   fi
@@ -556,7 +520,7 @@ download_helper_scripts() {
 
 start_management_containers() {
   echo -e "${YELLOW}#${RESET} Starting management containers using docker compose...\\n"
-  if ! sudo docker compose -p project-nomad -f "${NOMAD_DIR}/compose.yml" up -d; then
+  if ! sudo docker compose -p project-nomad -f "${NOMAD_DIR}/compose.yml" up -d --wait --wait-timeout 240; then
     echo -e "${RED}#${RESET} Failed to start management containers. Please check the logs and try again."
     exit 1
   fi
@@ -606,7 +570,7 @@ verify_gpu_setup() {
   fi
 
   # Check if Docker has NVIDIA runtime
-  if docker info 2>/dev/null | grep -q "nvidia"; then
+  if docker_has_nvidia_runtime; then
     echo -e "${GREEN}✓${RESET} Docker NVIDIA runtime configured\\n"
   else
     echo -e "${YELLOW}○${RESET} Docker NVIDIA runtime not detected\\n"
@@ -636,7 +600,12 @@ verify_gpu_setup() {
         amd_gfx_version='gfx1034'
       elif echo "${amd_devices}" | grep -iq 'Rembrandt'; then
         amd_gfx_version='gfx1035'
-      elif echo "${amd_devices}" | grep -iEq 'Phoenix1?|Phoenix2'; then
+      elif echo "${amd_devices}" | grep -iEq 'Phoenix[0-9]?|Hawk ?Point ?[0-9]?|Radeon (780M|760M)'; then
+        # Phoenix (Ryzen 7040) / Hawk Point (Ryzen 8040) — 780M & 760M are both gfx1103.
+        # lspci device strings vary (Phoenix1/Phoenix2/Phoenix3, "Hawk Point", "HawkPoint1", or the bare
+        # "Radeon 780M Graphics" marketing name), so match all of them or the marker goes
+        # missing and the 780M silently drops to CPU. Kept before the Strix branches so a
+        # "Radeon 780M" string can't be miscaught. See gfx1103 regression.
         amd_gfx_version='gfx1103'
       elif echo "${amd_devices}" | grep -iEq 'Strix Halo'; then
         amd_gfx_version='gfx1151'
@@ -683,13 +652,17 @@ verify_gpu_setup() {
     gpu_detected=true
   fi
 
-  if ($gpu_detected || $IS_WSL) && docker info 2>/dev/null | grep -q "nvidia"; then
+  local admin_image
+  admin_image=$(docker inspect --format '{{.Image}}' nomad_admin 2>/dev/null) || admin_image=''
+  if [[ -n "$admin_image" ]] && docker_has_nvidia_runtime &&
+     docker run --rm --network none --gpus all --entrypoint /bin/sh "$admin_image" \
+       -c 'timeout 15 nvidia-smi -L | grep -q "^GPU "'; then
     echo -e "${GREEN}#${RESET} GPU acceleration is properly configured! The AI Assistant will use your GPU.\\n"
   elif [[ "${has_amd_gpu}" == 'true' ]]; then
     echo -e "${GREEN}#${RESET} GPU acceleration will be enabled (AMD/ROCm) when AI Assistant is installed from the dashboard.\\n"
   else
     echo -e "${YELLOW}#${RESET} GPU acceleration not detected. The AI Assistant will run in CPU-only mode.\\n"
-    if $gpu_detected && ! docker info 2>/dev/null | grep -q "nvidia"; then
+    if $gpu_detected && ! docker_has_nvidia_runtime; then
       echo -e "${YELLOW}#${RESET} Tip: Your GPU is detected but Docker runtime is not configured.\\n"
       if $IS_WSL; then
         echo -e "${YELLOW}#${RESET} Try restarting Docker Desktop from the Windows system tray.\\n"
@@ -710,7 +683,7 @@ success_message() {
     echo -e "${GREEN}#${RESET} Project N.O.M.A.D's Command Center should automatically start whenever your device reboots. However, if you need to start it manually, you can always do so by running: ${WHITE_R}${NOMAD_DIR}/start_nomad.sh${RESET}\\n"
   fi
   echo -e "${GREEN}#${RESET} You can now access the management interface at http://localhost:8080 or http://${local_ip_address}:8080\\n"
-  echo -e "${GREEN}#${RESET} Thank you for supporting Project N.O.M.A.D!\\n"
+  echo -e "${GREEN}#${RESET} Thank you for supporting Project NOMAD!\\n"
 }
 
 ###################################################################################################################################################################################################
@@ -719,27 +692,33 @@ success_message() {
 #                                                                                                                                                                                                 #
 ###################################################################################################################################################################################################
 
-# Pre-flight checks
-check_is_debian_based
-check_is_x86_64
-check_is_bash
-check_has_sudo
-ensure_dependencies_installed
-check_is_debug_mode
+main() {
+  set -e
+  check_is_bash
+  check_is_debian_based
+  check_architecture
+  check_has_sudo
+  check_is_debug_mode
+  banner
+  sudo mkdir -p /run/project-nomad-installer
+  exec 9</run/project-nomad-installer
+  flock -n 9 || { echo "Another NOMAD installation is in progress." >&2; return 1; }
+  get_install_confirmation
+  accept_terms
+  ensure_dependencies_installed
+  ensure_docker_installed
+  check_docker_compose
+  setup_nvidia_container_toolkit
+  get_local_ip
+  create_nomad_directory
+  download_helper_scripts
+  download_management_compose_file
+  start_management_containers
+  verify_gpu_setup
+  success_message
+}
 
-# Main install
-get_install_confirmation
-accept_terms
-ensure_docker_installed
-check_docker_compose
-setup_nvidia_container_toolkit
-get_local_ip
-create_nomad_directory
-download_helper_scripts
-download_management_compose_file
-start_management_containers
-verify_gpu_setup
-success_message
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main; fi
 
 # free_space_check() {
 #   if [[ "$(df -B1 / | awk 'NR==2{print $4}')" -le '5368709120' ]]; then

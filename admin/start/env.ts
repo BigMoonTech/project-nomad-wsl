@@ -54,6 +54,7 @@ export default await Env.create(new URL('../', import.meta.url), {
   */
   REDIS_HOST: Env.schema.string({ format: 'host' }),
   REDIS_PORT: Env.schema.number(),
+  REDIS_DB: Env.schema.number.optional(),
 
   /*
   |----------------------------------------------------------
@@ -61,4 +62,18 @@ export default await Env.create(new URL('../', import.meta.url), {
   |----------------------------------------------------------
   */
   NOMAD_API_URL: Env.schema.string.optional(),
+
+  /*
+  |----------------------------------------------------------
+  | Creator Packs (gated content downloads)
+  |----------------------------------------------------------
+  | CREATOR_PACKS_APP_KEY is the shared bearer key the entitlement Worker
+  | requires; official release builds inject it at build time (it is NOT
+  | committed to source). When unset, pack installs fail with a clear
+  | "not configured" error and the rest of the app is unaffected.
+  | CREATOR_PACKS_WORKER_BASE overrides the default Worker origin (e.g. to
+  | point at a branded packs.projectnomad.us domain later).
+  */
+  CREATOR_PACKS_APP_KEY: Env.schema.string.optional(),
+  CREATOR_PACKS_WORKER_BASE: Env.schema.string.optional(),
 })

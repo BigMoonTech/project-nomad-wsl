@@ -1,11 +1,11 @@
 <div align="center">
-<img src="admin/public/project_nomad_logo.webp" width="200" height="200"/>
+<img src="admin/public/nomad-primary.svg" width="200" alt="Project NOMAD"/>
 
-# Project N.O.M.A.D. — WSL2 Edition
+# Project NOMAD for WSL2 and ARM64 Linux
 
 ### Node for Offline Media, Archives, and Data
 
-**Knowledge That Never Goes Offline — now on Windows**
+**Knowledge That Never Goes Offline**
 
 [![Website](https://img.shields.io/badge/Website-projectnomad.us-blue)](https://www.projectnomad.us)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2)](https://discord.com/invite/crosstalksolutions)
@@ -15,21 +15,13 @@
 
 ---
 
-> ## ⚠️ Unofficial Fork
->
-> **This is an unofficial fork of [Project N.O.M.A.D.](https://github.com/Crosstalk-Solutions/project-nomad) by [Crosstalk Solutions](https://crosstalksolutions.com), maintained by [BigMoonTech](https://github.com/BigMoonTech) to add first-class **Windows + WSL2 + Docker Desktop** support.
->
-> The original project targets Debian/Ubuntu Linux only. This fork detects WSL2 automatically and adapts the install and update flow accordingly — including correct NVIDIA GPU passthrough via Docker Desktop and the Windows NVIDIA driver, and automatic handling of WSL2's mount differences with no manual `wsl.conf` changes required. Native Linux installs continue to work unchanged.
->
-> **For official support, the upstream project, and the wider N.O.M.A.D. community, see the [original repository](https://github.com/Crosstalk-Solutions/project-nomad). For Windows/WSL2-specific issues, use [this fork's issue tracker](https://github.com/BigMoonTech/project-nomad-wsl/issues).**
+> This unofficial fork of [Project NOMAD](https://github.com/Crosstalk-Solutions/project-nomad) by Crosstalk Solutions is maintained by BigMoonTech. Report fork-specific installation and update issues in [this repository](https://github.com/BigMoonTech/project-nomad-wsl/issues).
 
----
-
-Project N.O.M.A.D. is a self-contained, offline-first knowledge and education server packed with critical tools, knowledge, and AI to keep you informed and empowered—anytime, anywhere.
+Project NOMAD is an offline-first knowledge and education server. Its browser-based Command Center manages local reference material, maps and AI services.
 
 ## Installation & Quickstart
 
-This fork supports both native Debian/Ubuntu and **Windows via WSL2 + Docker Desktop**.
+Use the same installer and release on Debian/Ubuntu x86-64, native ARM64 Linux (including DGX Spark), and Windows with WSL2 and Docker Desktop. Docker selects the matching Linux image. The base install needs about 5 GB of disk. Content and AI models need additional storage and memory.
 
 *Note: sudo/root privileges are required to run the install script*
 
@@ -41,6 +33,12 @@ curl -fsSL https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/
   -o install_nomad.sh && \
 sudo bash install_nomad.sh
 ```
+
+### DGX Spark and other native ARM64 Linux hosts
+
+Run Quick Install above in the host terminal. DGX Spark ships with Docker Engine and the NVIDIA Container Toolkit. Check `sudo docker info` and `sudo docker compose version` first. To check GPU access from a container, run `sudo docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L`. See the [DGX Spark container runtime guide](https://docs.nvidia.com/dgx/dgx-spark/nvidia-container-runtime-for-docker.html).
+
+Open `http://localhost:8080` after installation. AI Assistant and the Information Library have native ARM64 images. Supply Depot includes the official multi-platform Excalidraw editor and an offline Translated Library with a native Bergamot engine on each architecture. Existing installations on either platform receive releases through Settings → Check for Updates.
 
 ### Windows Install (WSL2 + Docker Desktop)
 
@@ -72,7 +70,7 @@ Open a browser and navigate to `http://localhost:8080` (or `http://DEVICE_IP:808
 For more control over the installation process, copy and paste the [Docker Compose template](https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/heads/main/install/management_compose.yaml) into a `docker-compose.yml` file and customize it to your liking (be sure to replace any placeholders with your actual values). Then, run `docker compose up -d` to start the Command Center and its dependencies. Note: this method is recommended for advanced users only, as it requires familiarity with Docker and manual configuration before starting.
 
 ## How It Works
-N.O.M.A.D. is a management UI ("Command Center") and API that orchestrates a collection of containerized tools and resources via [Docker](https://www.docker.com/). It handles installation, configuration, and updates for everything — so you don't have to.
+NOMAD is a management UI ("Command Center") and API that orchestrates a collection of containerized tools and resources via [Docker](https://www.docker.com/). It handles installation, configuration, and updates for everything — so you don't have to.
 
 **Built-in capabilities include:**
 - **AI Chat with Knowledge Base** — local AI chat powered by [Ollama](https://ollama.com/) or you can use OpenAI API compatible software such as LM Studio or llama.cpp, with document upload and semantic search (RAG via [Qdrant](https://qdrant.tech/))
@@ -82,9 +80,11 @@ N.O.M.A.D. is a management UI ("Command Center") and API that orchestrates a col
 - **Data Tools** — encryption, encoding, and analysis via [CyberChef](https://gchq.github.io/CyberChef/)
 - **Notes** — local note-taking via [FlatNotes](https://github.com/dullage/flatnotes)
 - **System Benchmark** — hardware scoring with a [community leaderboard](https://benchmark.projectnomad.us)
+- **Supply Depot** — a one-click app catalog (PDF tools, file browser, e-book library, password manager, and more) plus the ability to run your own custom Docker containers
+- **Automatic Updates** — opt-in, hands-off updates for the core software, installed apps, and offline content, on a schedule you control
 - **Easy Setup Wizard** — guided first-time configuration with curated content collections
 
-N.O.M.A.D. also includes built-in tools like a Wikipedia content selector, ZIM library manager, and content explorer.
+NOMAD also includes built-in tools like a Wikipedia content selector, ZIM library manager, and content explorer.
 
 ## What's Included
 
@@ -93,79 +93,118 @@ N.O.M.A.D. also includes built-in tools like a Wikipedia content selector, ZIM l
 | Information Library | Kiwix | Offline Wikipedia, medical references, survival guides, ebooks |
 | AI Assistant | Ollama + Qdrant | Built-in chat with document upload and semantic search |
 | Education Platform | Kolibri | Khan Academy courses, progress tracking, multi-user support |
-| Offline Maps | ProtoMaps | Downloadable regional maps with search and navigation |
+| Offline Maps | ProtoMaps | Downloadable regional maps for offline viewing and search |
 | Data Tools | CyberChef | Encryption, encoding, hashing, and data analysis |
 | Notes | FlatNotes | Local note-taking with markdown support |
 | System Benchmark | Built-in | Hardware scoring, Builder Tags, and community leaderboard |
+| Supply Depot | Built-in | One-click app catalog + bring-your-own custom Docker containers |
 
 ## Device Requirements
-While many similar offline survival computers are designed to be run on bare-minimum, lightweight hardware, Project N.O.M.A.D. is quite the opposite. To install and run the
+While many similar offline survival computers are designed to be run on bare-minimum, lightweight hardware, Project NOMAD is quite the opposite. To install and run the
 available AI tools, we highly encourage the use of a beefy, GPU-backed device to make the most of your install.
 
-At it's core, however, N.O.M.A.D. is still very lightweight. For a barebones installation of the management application itself, the following minimal specs are required:
+At its core, however, NOMAD is still very lightweight. For a barebones installation of the management application itself, the following minimal specs are required:
 
-*Note: Project N.O.M.A.D. is not sponsored by any hardware manufacturer and is designed to be as hardware-agnostic as possible. The harware listed below is for example/comparison use only*
+*Note: Project NOMAD is not sponsored by any hardware manufacturer and is designed to be as hardware-agnostic as possible. The hardware listed below is for example/comparison use only*
 
 #### Minimum Specs
 - Processor: 2 GHz dual-core processor or better
-- RAM: 4GB system memory
-- Storage: At least 5 GB free disk space
-- OS: Debian-based (Ubuntu recommended)
+- RAM: 4GB system memory (the whole stack without AI runs in under 1 GB)
+- Storage: At least 5 GB free disk space (plan for 10 GB to install comfortably)
+- OS: Debian-based (Ubuntu 26.04 LTS recommended)
 - Stable internet connection (required during install only)
 
-To run LLM's and other included AI tools:
+Adding the AI Assistant brings the install to roughly **25 GB**, because Ollama and a general-purpose model are both large, and a model needs about its download size in memory while it answers. That memory comes from VRAM if you have a discrete GPU and from system RAM if you do not, which is the single biggest reason the figures below are so much higher.
+
+To run LLMs and other included AI tools:
 
 #### Optimal Specs
 - Processor: AMD Ryzen 7 or Intel Core i7 or better
 - RAM: 32 GB system memory
 - Graphics: NVIDIA RTX 3060 or AMD equivalent or better (more VRAM = run larger models)
 - Storage: At least 250 GB free disk space (preferably on SSD)
-- OS: Debian-based (Ubuntu recommended)
+- OS: Debian-based (Ubuntu 26.04 LTS recommended)
 - Stable internet connection (required during install only)
 
 **For detailed build recommendations at three price points ($150–$1,000+), see the [Hardware Guide](https://www.projectnomad.us/hardware).**
 
-Again, Project N.O.M.A.D. itself is quite lightweight - it's the tools and resources you choose to install with N.O.M.A.D. that will determine the specs required for your unique deployment
+Again, Project NOMAD itself is quite lightweight — it's the tools and resources you choose to install with NOMAD that will determine the specs required for your unique deployment
 
 #### Running AI models on a different host
-By default, N.O.M.A.D.'s installer will attempt to setup Ollama on the host when the AI Assistant is installed. However, if you would like to run the AI model on a different host, you can go to the settings of of the AI assistant and input a URL for either an ollama or OpenAI-compatible API server (such as LM Studio).  
-Note that if you use Ollama on a different host, you must start the server with this option `OLLAMA_HOST=0.0.0.0`.  
-Ollama is the preferred way to use the AI assistant as it has features such as model download that OpenAI API does not support. So when using LM Studio for example, you will have to use LM Studio to download models.
+By default, NOMAD's installer will attempt to setup Ollama on the host when the AI Assistant is installed. However, if you would like to run the AI model on a different host, you can go to the settings of the AI assistant and input a URL for either an ollama or OpenAI-compatible API server (such as LM Studio).  
+Note that if you use Ollama on a different host, you must start the server with this option: `OLLAMA_HOST=0.0.0.0`.  
+Ollama is the preferred way to use the AI assistant, as it has features such as model download that OpenAI API does not support. So when using LM Studio, for example, you will have to use LM Studio to download models.
 You are responsible for the setup of Ollama/OpenAI server on the other host.
 
 ## Frequently Asked Questions (FAQ)
-For answers to common questions about Project N.O.M.A.D., please see our [FAQ](FAQ.md) page.
+For answers to common questions about Project NOMAD, please see our [FAQ](FAQ.md) page.
 
 ## About Internet Usage & Privacy
-Project N.O.M.A.D. is designed for offline usage. An internet connection is only required during the initial installation (to download dependencies) and if you (the user) decide to download additional tools and resources at a later time. Otherwise, N.O.M.A.D. does not require an internet connection and has ZERO built-in telemetry.
+Project NOMAD is designed for offline usage. An internet connection is only required during the initial installation (to download dependencies) and if you (the user) decide to download additional tools and resources at a later time. Otherwise, NOMAD does not require an internet connection and has ZERO built-in telemetry.
 
-To test internet connectivity, N.O.M.A.D. attempts to make a request to Cloudflare's utility endpoint, `https://1.1.1.1/cdn-cgi/trace` and checks for a successful response.
+To test internet connectivity, NOMAD first attempts to make a request to Cloudflare's utility endpoint, `https://1.1.1.1/cdn-cgi/trace`. If that endpoint is unreachable (for example, because your network blocks `1.1.1.1`), it falls back to other endpoints the application already contacts (the GitHub API and the Project NOMAD API) and considers the connection online if any of them respond.
+
+You can override the endpoint used for this check in two ways. The connectivity test URL can be configured from the UI under **Settings → Advanced** (stored locally on your instance), or you can set the `INTERNET_STATUS_TEST_URL` environment variable. When set, the environment variable always takes precedence over the UI-configured value. If neither is set, the built-in defaults above are used.
 
 ## About Security
-By design, Project N.O.M.A.D. is intended to be open and available without hurdles - it includes no authentication. If you decide to connect your device to a local network after install (e.g. for allowing other devices to access it's resources), you can block/open ports to control which services are exposed.
+By design, Project NOMAD is intended to be open and available without hurdles — it includes no authentication. If you decide to connect your device to a local network after install (e.g. for allowing other devices to access its resources), you can block/open ports to control which services are exposed.
 
-**Will authentication be added in the future?** Maybe. It's not currently a priority, but if there's enough demand for it, we may consider building in an optional authentication layer in a future release to support uses cases where multiple users need access to the same instance but with different permission levels (e.g. family use with parental controls, classroom use with teacher/admin accounts, etc.). We have a suggestion for this on our public roadmap, so if this is something you'd like to see, please upvote it here: https://roadmap.projectnomad.us/posts/1/user-authentication-please-build-in-user-auth-with-admin-user-roles
+**Will authentication be added in the future?** Maybe. It's not currently a priority, but if there's enough demand for it, we may consider building in an optional authentication layer in a future release to support use cases where multiple users need access to the same instance but with different permission levels (e.g. family use with parental controls, classroom use with teacher/admin accounts, etc.). We have a suggestion for this on our public roadmap, so if this is something you'd like to see, please upvote it here: https://roadmap.projectnomad.us/posts/1/user-authentication-please-build-in-user-auth-with-admin-user-roles
 
-For now, we recommend using network-level controls to manage access if you're planning to expose your N.O.M.A.D. instance to other devices on a local network. N.O.M.A.D. is not designed to be exposed directly to the internet, and we strongly advise against doing so unless you really know what you're doing, have taken appropriate security measures, and understand the risks involved.
+For now, we recommend using network-level controls to manage access if you're planning to expose your NOMAD instance to other devices on a local network. NOMAD is not designed to be exposed directly to the internet, and we strongly advise against doing so unless you really know what you're doing, have taken appropriate security measures, and understand the risks involved.
 
 ## Contributing
 Contributions are welcome and appreciated! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to the project.
+
+### Testing Auto-Updates (Dry Run)
+
+The Command Center can automatically install **minor/patch** updates of itself during a configurable window, after a cool-off period, and only when pre-flight checks pass (sufficient disk for the new image, no downloads or app installs in progress). Major versions always require a manual update.
+
+Because exercising this logic with real version bumps is impractical, an Ace command runs the **entire decision pipeline without ever triggering an update**. Run it from the `admin/` directory:
+
+```bash
+# 1) Deterministic scenario suite — no network, DB, or Docker required.
+#    Proves every branch (major-only, cool-off, prerelease/draft, window wrap, …)
+#    and exits non-zero on failure, so it's safe to wire into CI.
+node ace auto-update:dry-run --scenarios
+
+# 2) Simulate "what would happen if I were running 1.32.0 right now?"
+#    against the LIVE GitHub releases feed and real pre-flight checks:
+node ace auto-update:dry-run --current=1.32.0 --force-enabled
+
+# 3) Fully offline simulation with a canned release list and a fixed clock:
+node ace auto-update:dry-run --current=1.32.0 --force-enabled \
+  --releases-file=./fixtures/releases.json --now=2026-06-04T21:00:00Z \
+  --window-start=20:00 --window-end=23:00 --cooloff=72 --skip-preflight
+```
+
+It prints the resolved decision — current version, whether the clock is inside the window, the eligible target (if any), and pre-flight blockers — ending in a clear verdict such as `WOULD UPDATE → v1.33.2` or `WOULD NOT UPDATE (outside-window): …`. **No real update is ever requested.**
+
+| Flag | Description |
+|------|-------------|
+| `--scenarios` | Run the built-in deterministic scenario suite and exit |
+| `--current=<version>` | Simulate this currently-running version (e.g. `1.32.0`) |
+| `--force-enabled` | Treat auto-update as enabled, ignoring the saved setting |
+| `--cooloff=<hours>` | Override the cool-off period |
+| `--window-start=<HH:MM>` / `--window-end=<HH:MM>` | Override the update window |
+| `--now=<ISO timestamp>` | Simulate the clock at a specific time |
+| `--releases-file=<path>` | Use a local JSON releases array instead of fetching GitHub (offline) |
+| `--skip-preflight` | Bypass the Docker/disk/queue pre-flight checks |
 
 ## Community & Resources
 
 - **Website:** [www.projectnomad.us](https://www.projectnomad.us) - Learn more about the project
 - **Discord:** [Join the Community](https://discord.com/invite/crosstalksolutions) - Get help, share your builds, and connect with other NOMAD users
 - **Benchmark Leaderboard:** [benchmark.projectnomad.us](https://benchmark.projectnomad.us) - See how your hardware stacks up against other NOMAD builds
-- **Troubleshooting Guide:** [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Find solutions to common issues
 - **FAQ:** [FAQ.md](FAQ.md) - Find answers to frequently asked questions
 - **Community Add-Ons:** [admin/docs/community-add-ons.md](admin/docs/community-add-ons.md) - Third-party content packs built by the community
 
 ## License
 
-Project N.O.M.A.D. is licensed under the [Apache License 2.0](LICENSE).
+Project NOMAD is licensed under the [Apache License 2.0](LICENSE).
 
 ## Helper Scripts
-Once installed, Project N.O.M.A.D. has a few helper scripts should you ever need to troubleshoot issues or perform maintenance that can't be done through the Command Center. All of these scripts are found in Project N.O.M.A.D.'s install directory, `/opt/project-nomad`
+Once installed, Project NOMAD has a few helper scripts should you ever need to troubleshoot issues or perform maintenance that can't be done through the Command Center. All of these scripts are found in Project NOMAD's install directory, `/opt/project-nomad`
 
 ###
 

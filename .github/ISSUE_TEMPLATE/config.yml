@@ -1,11 +1,14 @@
 blank_issues_enabled: true
 contact_links:
-  - name: ⚠️ Is this a Windows/WSL2-specific issue?
+  - name: ⚠️ Is this a Windows/WSL2 or native ARM64 issue?
     url: https://github.com/BigMoonTech/project-nomad-wsl/issues/new
-    about: Yes — this fork only handles Windows/WSL2 + Docker Desktop bugs. Open an issue here.
+    about: Report problems with this fork on Windows/WSL2 or native ARM64 Linux.
   - name: 🐧 Is this a general N.O.M.A.D. issue (not Windows-specific)?
     url: https://github.com/Crosstalk-Solutions/project-nomad/issues/new
     about: Report it on the official upstream project — they handle the core app
+  - name: 🔒 Report an upstream security vulnerability
+    url: https://github.com/Crosstalk-Solutions/project-nomad/security/advisories/new
+    about: Report security issues in the upstream project privately.
   - name: 💬 Discord Community (upstream)
     url: https://discord.com/invite/crosstalksolutions
     about: Join the official N.O.M.A.D. Discord for general questions and discussion

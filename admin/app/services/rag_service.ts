@@ -4,28 +4,56 @@ import { inject } from '@adonisjs/core'
 import logger from '@adonisjs/core/services/logger'
 import { TokenChunker } from '@chonkiejs/core'
 import sharp from 'sharp'
-import { deleteFileIfExists, determineFileType, getFile, getFileStatsIfExists, listDirectoryContentsRecursive, ZIM_STORAGE_PATH } from '../utils/fs.js'
+import {
+  deleteFileIfExists,
+  determineFileType,
+  getFile,
+  getFileStatsIfExists,
+  listDirectoryContentsRecursive,
+  ZIM_STORAGE_PATH,
+} from '../utils/fs.js'
 import { PDFParse } from 'pdf-parse'
 import { createWorker } from 'tesseract.js'
 import { fromBuffer } from 'pdf2pic'
 import JSZip from 'jszip'
 import * as cheerio from 'cheerio'
+import mammoth from 'mammoth'
 import { OllamaService } from './ollama_service.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { removeStopwords } from 'stopword'
 import { randomUUID } from 'node:crypto'
-import { join, resolve, sep } from 'node:path'
+import { join, relative, resolve, sep } from 'node:path'
 import KVStore from '#models/kv_store'
 import KbIngestState from '#models/kb_ingest_state'
 import { decideScanAction, type IngestPolicy } from '../utils/kb_ingest_decision.js'
+import { decideOrphans } from '../utils/kb_orphan_decision.js'
+import { decideContentReindex, type ReindexOutcome } from '../utils/content_reindex_decision.js'
 import KbRatioRegistry from '#models/kb_ratio_registry'
 import { decideWarnings } from '../utils/kb_warning_decision.js'
-import type { FileWarning, FileWarningsResult, StoredFileInfo } from '../../types/rag.js'
+import type { FileWarning, FileWarningsResult, RetrievalFloorStats, RetrievalStages, StoredFileInfo } from '../../types/rag.js'
+import { applyRelevanceFloor } from '../utils/misc.js'
+import { KB_EVAL_COLLECTION } from '../../constants/kb_collections.js'
+
+/**
+ * Qdrant filter that hides the developer eval corpus from every read path that
+ * enumerates the *user's* knowledge base. The fixtures share this collection
+ * (NOMAD collections are a payload tag), so without this they would show up as
+ * broken files in the KB UI and skew the ingest-health warnings.
+ */
+const EXCLUDE_EVAL_FILTER = {
+  must_not: [{ key: 'collection', match: { value: KB_EVAL_COLLECTION } }],
+}
 import type { KbIngestStateValue } from '../../types/kb_ingest_state.js'
 import { ZIMExtractionService } from './zim_extraction_service.js'
 import { ZIM_BATCH_SIZE } from '../../constants/zim_extraction.js'
+import { hasMoreArticleBatches } from '../utils/zim_batch_decision.js'
 import { EMBEDDING_MODEL_NAME } from '../../constants/ollama.js'
-import { ProcessAndEmbedFileResponse, ProcessZIMFileResponse, RAGResult, RerankedRAGResult } from '../../types/rag.js'
+import {
+  ProcessAndEmbedFileResponse,
+  ProcessZIMFileResponse,
+  RAGResult,
+  RerankedRAGResult,
+} from '../../types/rag.js'
 
 export type EmbedSingleFileFailureCode =
   | 'not_found'
@@ -43,6 +71,10 @@ export class RagService {
   private qdrantInitPromise: Promise<void> | null = null
   private embeddingModelVerified = false
   private resolvedEmbeddingModel: string | null = null
+  // Collections already verified this session (created + payload indexes in place).
+  // Skips the getCollections/createPayloadIndex round-trips that otherwise run on
+  // every embed call — ~45% of per-document Qdrant time on large ingestions (#1129)
+  private ensuredCollections = new Set<string>()
   public static UPLOADS_STORAGE_PATH = 'storage/kb_uploads'
   public static CONTENT_COLLECTION_NAME = 'nomad_knowledge_base'
   public static EMBEDDING_DIMENSION = 768 // Nomic Embed Text v1.5 dimension is 768
@@ -53,10 +85,14 @@ export class RagService {
   public static MODEL_CONTEXT_LENGTH = 2048 // nomic-embed-text has 2K token context
   public static MAX_SAFE_TOKENS = 1600 // Leave buffer for prefix and tokenization variance
   public static TARGET_TOKENS_PER_CHUNK = 1500 // Target 1500 tokens per chunk for embedding
+  // Overlap between adjacent chunks. Was an inline literal at the chunker call
+  // site; named here because it shapes what lands in the vector store and so
+  // must be part of the eval corpus fingerprint.
+  public static CHUNK_OVERLAP_TOKENS = 150
   public static PREFIX_TOKEN_BUDGET = 10 // Reserve ~10 tokens for prefixes
   public static CHAR_TO_TOKEN_RATIO = 2 // Conservative chars-per-token estimate; technical docs
-                                         // (numbers, symbols, abbreviations) tokenize denser
-                                         // than plain prose (~3), so 2 avoids context overflows
+  // (numbers, symbols, abbreviations) tokenize denser
+  // than plain prose (~3), so 2 avoids context overflows
   // Nomic Embed Text v1.5 uses task-specific prefixes for optimal performance
   public static SEARCH_DOCUMENT_PREFIX = 'search_document: '
   public static SEARCH_QUERY_PREFIX = 'search_query: '
@@ -65,14 +101,16 @@ export class RagService {
   constructor(
     private dockerService: DockerService,
     private ollamaService: OllamaService
-  ) { }
+  ) {}
 
   private async _initializeQdrantClient() {
     if (!this.qdrantInitPromise) {
       this.qdrantInitPromise = (async () => {
         const qdrantUrl = await this.dockerService.getServiceURL(SERVICE_NAMES.QDRANT)
         if (!qdrantUrl) {
-          throw new Error('Qdrant vector database is offline. Restart the AI Assistant service in Settings to restore the Knowledge Base.')
+          throw new Error(
+            'Qdrant vector database is offline. Restart the AI Assistant service in Settings to restore the Knowledge Base.'
+          )
         }
         this.qdrant = new QdrantClient({ url: qdrantUrl })
       })().catch((err) => {
@@ -92,9 +130,12 @@ export class RagService {
     } catch {
       this.qdrant = null
       this.qdrantInitPromise = null
+      // Qdrant may have restarted (or been recreated) — re-verify collections on reconnect
+      this.ensuredCollections.clear()
       return {
         online: false,
-        message: 'Qdrant vector database is offline. Restart the AI Assistant service in Settings to restore the Knowledge Base.',
+        message:
+          'Qdrant vector database is offline. Restart the AI Assistant service in Settings to restore the Knowledge Base.',
       }
     }
   }
@@ -111,6 +152,11 @@ export class RagService {
   ) {
     try {
       await this._ensureDependencies()
+
+      if (this.ensuredCollections.has(collectionName)) {
+        return
+      }
+
       const collections = await this.qdrant!.getCollections()
       const collectionExists = collections.collections.some((col) => col.name === collectionName)
 
@@ -132,6 +178,28 @@ export class RagService {
         field_name: 'content_type',
         field_schema: 'keyword',
       })
+      await this.qdrant!.createPayloadIndex(collectionName, {
+        field_name: 'collection',
+        field_schema: 'keyword',
+      })
+      await this.qdrant!.createPayloadIndex(collectionName, {
+        field_name: 'active',
+        field_schema: 'bool',
+      })
+
+      // Backfill: stamp `active: true` on any point that predates this field.
+      // `is_empty` (not a match-all filter) means this only ever touches points
+      // that have never been explicitly set, so re-running this on every boot
+      // can never clobber a user's explicit toggle-off. This is data hygiene
+      // only — search correctness never depends on it having run (see the
+      // must_not filter in searchSimilarDocuments).
+      await this.qdrant!.setPayload(collectionName, {
+        payload: { active: true },
+        filter: { must: [{ is_empty: { key: 'active' } }] },
+      })
+
+      // Only memoize after every step succeeded, so a partial failure is retried
+      this.ensuredCollections.add(collectionName)
     } catch (error) {
       logger.error('Error ensuring Qdrant collection:', error)
       throw error
@@ -146,15 +214,17 @@ export class RagService {
    * - Control characters (except newlines, tabs, and carriage returns)
    */
   private sanitizeText(text: string): string {
-    return text
-      // Null bytes
-      .replace(/\x00/g, '')
-      // Problematic control characters (keep \n, \r, \t)
-      .replace(/[\x01-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
-      // Invalid Unicode surrogates
-      .replace(/[\uD800-\uDFFF]/g, '')
-      // Trim extra whitespace
-      .trim()
+    return (
+      text
+        // Null bytes
+        .replace(/\x00/g, '')
+        // Problematic control characters (keep \n, \r, \t)
+        .replace(/[\x01-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
+        // Invalid Unicode surrogates
+        .replace(/[\uD800-\uDFFF]/g, '')
+        // Trim extra whitespace
+        .trim()
+    )
   }
 
   /**
@@ -208,33 +278,33 @@ export class RagService {
    * TODO: We could probably move this to a separate QueryPreprocessor class if it grows more complex, but for now it's manageable here.
    */
   private static QUERY_EXPANSION_DICTIONARY: Record<string, string> = {
-    'bob': 'bug out bag',
-    'bov': 'bug out vehicle',
-    'bol': 'bug out location',
-    'edc': 'every day carry',
-    'mre': 'meal ready to eat',
-    'shtf': 'shit hits the fan',
-    'teotwawki': 'the end of the world as we know it',
-    'opsec': 'operational security',
-    'ifak': 'individual first aid kit',
-    'ghb': 'get home bag',
-    'ghi': 'get home in',
-    'wrol': 'without rule of law',
-    'emp': 'electromagnetic pulse',
-    'ham': 'ham amateur radio',
-    'nbr': 'nuclear biological radiological',
-    'cbrn': 'chemical biological radiological nuclear',
-    'sar': 'search and rescue',
-    'comms': 'communications radio',
-    'fifo': 'first in first out',
-    'mylar': 'mylar bag food storage',
-    'paracord': 'paracord 550 cord',
-    'ferro': 'ferro rod fire starter',
-    'bivvy': 'bivvy bivy emergency shelter',
-    'bdu': 'battle dress uniform',
-    'gmrs': 'general mobile radio service',
-    'frs': 'family radio service',
-    'nbc': 'nuclear biological chemical',
+    bob: 'bug out bag',
+    bov: 'bug out vehicle',
+    bol: 'bug out location',
+    edc: 'every day carry',
+    mre: 'meal ready to eat',
+    shtf: 'shit hits the fan',
+    teotwawki: 'the end of the world as we know it',
+    opsec: 'operational security',
+    ifak: 'individual first aid kit',
+    ghb: 'get home bag',
+    ghi: 'get home in',
+    wrol: 'without rule of law',
+    emp: 'electromagnetic pulse',
+    ham: 'ham amateur radio',
+    nbr: 'nuclear biological radiological',
+    cbrn: 'chemical biological radiological nuclear',
+    sar: 'search and rescue',
+    comms: 'communications radio',
+    fifo: 'first in first out',
+    mylar: 'mylar bag food storage',
+    paracord: 'paracord 550 cord',
+    ferro: 'ferro rod fire starter',
+    bivvy: 'bivvy bivy emergency shelter',
+    bdu: 'battle dress uniform',
+    gmrs: 'general mobile radio service',
+    frs: 'family radio service',
+    nbc: 'nuclear biological chemical',
   }
 
   private preprocessQuery(query: string): string {
@@ -316,7 +386,7 @@ export class RagService {
       // We need to convert our embedding model's token counts to character counts
       // since nomic-embed-text tokenizer uses ~3 chars per token
       const targetCharsPerChunk = Math.floor(RagService.TARGET_TOKENS_PER_CHUNK * RagService.CHAR_TO_TOKEN_RATIO)
-      const overlapChars = Math.floor(150 * RagService.CHAR_TO_TOKEN_RATIO)
+      const overlapChars = Math.floor(RagService.CHUNK_OVERLAP_TOKENS * RagService.CHAR_TO_TOKEN_RATIO)
 
       const chunker = await TokenChunker.create({
         chunkSize: targetCharsPerChunk,
@@ -363,9 +433,14 @@ export class RagService {
         const batchStart = batchIdx * batchSize
         const batch = prefixedChunks.slice(batchStart, batchStart + batchSize)
 
-        logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`)
+        logger.debug(
+          `[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`
+        )
 
-        const response = await this.ollamaService.embed(this.resolvedEmbeddingModel ?? EMBEDDING_MODEL_NAME, batch)
+        const response = await this.ollamaService.embed(
+          this.resolvedEmbeddingModel ?? EMBEDDING_MODEL_NAME,
+          batch
+        )
 
         embeddings.push(...response.embeddings)
 
@@ -376,6 +451,18 @@ export class RagService {
       }
 
       const timestamp = Date.now()
+
+      // Sanitize source metadata once up front — every chunk in this call shares
+      // the same source.
+      const sanitizedSource =
+        typeof metadata.source === 'string' ? this.sanitizeText(metadata.source) : 'unknown'
+
+      // Preserve an existing file's active/inactive toggle across re-ingestion
+      // (retries, force re-embeds, replaced-content reindexing, etc.) instead of
+      // resetting it to active on every write. A genuinely new file (no row yet)
+      // still defaults to active.
+      const active = await this._readActiveFlag(sanitizedSource)
+
       const points = chunks.map((chunkText, index) => {
         // Sanitize text to prevent JSON encoding errors
         const sanitizedText = this.sanitizeText(chunkText)
@@ -396,13 +483,10 @@ export class RagService {
 
         logger.debug(`[RAG] Extracted keywords for chunk ${index}: [${allKeywords.join(', ')}]`)
         if (structuralKeywords.length > 0) {
-          logger.debug(`[RAG]   - Structural: [${structuralKeywords.join(', ')}], Content: [${contentKeywords.join(', ')}]`)
+          logger.debug(
+            `[RAG]   - Structural: [${structuralKeywords.join(', ')}], Content: [${contentKeywords.join(', ')}]`
+          )
         }
-
-        // Sanitize source metadata as well
-        const sanitizedSource = typeof metadata.source === 'string'
-          ? this.sanitizeText(metadata.source)
-          : 'unknown'
 
         return {
           id: randomUUID(), // qdrant requires either uuid or unsigned int
@@ -415,12 +499,26 @@ export class RagService {
             keywords: allKeywords.join(' '), // store as space-separated string for text search
             char_count: sanitizedText.length,
             created_at: timestamp,
-            source: sanitizedSource
+            source: sanitizedSource,
+            active,
           },
         }
       })
 
       await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
+
+      // A toggle can land between the read above and the upsert, and its
+      // setPayload then misses these points. The toggles write the row before
+      // Qdrant, so re-reading after the upsert closes the gap: either this read
+      // sees the new value, or the toggle's setPayload runs after the upsert and
+      // covers these points itself.
+      const currentActive = await this._readActiveFlag(sanitizedSource)
+      if (currentActive !== active) {
+        await this.qdrant!.setPayload(RagService.CONTENT_COLLECTION_NAME, {
+          payload: { active: currentActive },
+          points: points.map((p) => p.id),
+        })
+      }
 
       logger.debug(`[RAG] Successfully embedded and stored ${chunks.length} chunks`)
       logger.debug(`[RAG] First chunk preview: "${chunks[0].substring(0, 100)}..."`)
@@ -509,7 +607,8 @@ export class RagService {
     filepath: string,
     deleteAfterEmbedding: boolean,
     batchOffset?: number,
-    onProgress?: (percent: number) => Promise<void>
+    onProgress?: (percent: number) => Promise<void>,
+    collection?: string
   ): Promise<ProcessZIMFileResponse> {
     const zimExtractionService = new ZIMExtractionService()
 
@@ -520,10 +619,14 @@ export class RagService {
       `[RAG] Extracting ZIM content (batch: offset=${startOffset}, size=${ZIM_BATCH_SIZE})`
     )
 
-    const { chunks: zimChunks, totalArticles } = await zimExtractionService.extractZIMContent(
-      filepath,
-      { startOffset, batchSize: ZIM_BATCH_SIZE }
-    )
+    const {
+      chunks: zimChunks,
+      totalArticles,
+      articlesProcessed,
+    } = await zimExtractionService.extractZIMContent(filepath, {
+      startOffset,
+      batchSize: ZIM_BATCH_SIZE,
+    })
 
     logger.info(
       `[RAG] Extracted ${zimChunks.length} chunks from ZIM file with enhanced metadata (file totalArticles=${totalArticles})`
@@ -536,6 +639,9 @@ export class RagService {
       const result = await this.embedAndStoreText(zimChunk.text, {
         source: filepath,
         content_type: 'zim_article',
+        // Without this the ZIM path writes points with no `collection` at all, so
+        // getKnowledgeCollections() (which facets on it) never sees them.
+        ...(collection ? { collection } : {}),
 
         // Article-level context
         article_title: zimChunk.articleTitle,
@@ -571,15 +677,19 @@ export class RagService {
       }
     }
 
-    // Count unique articles processed in this batch. hasMoreBatches gates on the article
-    // count — zimChunks.length counts section-level chunks (multiple per article under the
-    // 'structured' strategy), so comparing it to ZIM_BATCH_SIZE (an article limit) caps
-    // processing at the first batch for any real archive.
-    const articlesInBatch = new Set(zimChunks.map((c) => c.documentId)).size
-    const hasMoreBatches = articlesInBatch >= ZIM_BATCH_SIZE
+    // Gate the continuation on articles the extractor CONSUMED, not on articles that
+    // produced chunks. Articles whose text is empty after cleaning (redirect stubs,
+    // category pages, media/PDF wrappers) contribute no documentIds, so a chunk-derived
+    // count reads a normal sparse batch as end-of-archive and silently abandons the rest
+    // of the file. See `zim_batch_decision.ts` for the full rationale.
+    const articlesWithContent = new Set(zimChunks.map((c) => c.documentId)).size
+    const hasMoreBatches = hasMoreArticleBatches({
+      articlesProcessed,
+      batchSize: ZIM_BATCH_SIZE,
+    })
 
     logger.info(
-      `[RAG] Successfully embedded ${totalChunks} total chunks from ${articlesInBatch} articles (hasMore: ${hasMoreBatches})`
+      `[RAG] Successfully embedded ${totalChunks} total chunks from ${articlesWithContent}/${articlesProcessed} articles (hasMore: ${hasMoreBatches})`
     )
 
     // Only delete the file when:
@@ -601,13 +711,27 @@ export class RagService {
         : 'ZIM file processed and embedded successfully with enhanced metadata.',
       chunks: totalChunks,
       hasMoreBatches,
-      articlesProcessed: articlesInBatch,
+      // MUST be the consumed count: EmbedFileJob advances the next batch offset by this
+      // value. Reporting the content-bearing count instead re-reads the overlap on every
+      // sparse batch, and a batch that yields no text at all would advance the offset by
+      // zero and re-run the same window forever.
+      articlesProcessed,
       totalArticles,
     }
   }
 
   private async processTextFile(fileBuffer: Buffer): Promise<string> {
     return await this.extractTXTText(fileBuffer)
+  }
+
+  /**
+   * Extract text content from a DOCX file using mammoth. DOCX is a ZIP-based
+   * XML format, so raw-text extraction (extractTXTText) would return garbage —
+   * this parses the document XML properly and returns clean plain text.
+   */
+  private async processDocxFile(fileBuffer: Buffer): Promise<string> {
+    const { value: text } = await mammoth.extractRawText({ buffer: fileBuffer })
+    return text
   }
 
   /**
@@ -665,9 +789,7 @@ export class RagService {
     })
 
     // If no spine found, fall back to all manifest items
-    const contentFiles = spineOrder.length > 0
-      ? spineOrder
-      : Array.from(manifestItems.values())
+    const contentFiles = spineOrder.length > 0 ? spineOrder : Array.from(manifestItems.values())
 
     // Extract text from each content file in order
     const textParts: string[] = []
@@ -686,7 +808,9 @@ export class RagService {
     }
 
     const fullText = textParts.join('\n\n')
-    logger.debug(`[RAG] EPUB extracted ${textParts.length} chapters, ${fullText.length} characters total`)
+    logger.debug(
+      `[RAG] EPUB extracted ${textParts.length} chapters, ${fullText.length} characters total`
+    )
     return fullText
   }
 
@@ -694,15 +818,24 @@ export class RagService {
     extractedText: string,
     filepath: string,
     deleteAfterEmbedding: boolean = false,
-    onProgress?: (percent: number) => Promise<void>
+    onProgress?: (percent: number) => Promise<void>,
+    collection?: string
   ): Promise<{ success: boolean; message: string; chunks?: number }> {
     if (!extractedText || extractedText.trim().length === 0) {
-      return { success: false, message: 'Process completed succesfully, but no text was found to embed.' }
+      return {
+        success: false,
+        message: 'Process completed succesfully, but no text was found to embed.',
+      }
     }
 
-    const embedResult = await this.embedAndStoreText(extractedText, {
-      source: filepath
-    }, onProgress)
+    const embedResult = await this.embedAndStoreText(
+      extractedText,
+      {
+        source: filepath,
+        ...(collection ? { collection } : {}),
+      },
+      onProgress
+    )
 
     if (!embedResult) {
       return { success: false, message: 'Failed to embed and store the extracted text.' }
@@ -723,7 +856,7 @@ export class RagService {
   /**
    * Main pipeline to process and embed an uploaded file into the RAG knowledge base.
    * This includes text extraction, chunking, embedding, and storing in Qdrant.
-   * 
+   *
    * Orchestrates file type detection and delegates to specialized processors.
    * For ZIM files, supports batch processing via batchOffset parameter.
    */
@@ -731,7 +864,8 @@ export class RagService {
     filepath: string,
     deleteAfterEmbedding: boolean = false,
     batchOffset?: number,
-    onProgress?: (percent: number) => Promise<void>
+    onProgress?: (percent: number) => Promise<void>,
+    collection?: string
   ): Promise<ProcessAndEmbedFileResponse> {
     try {
       const fileType = determineFileType(filepath)
@@ -750,7 +884,7 @@ export class RagService {
       // Process based on file type
       // ZIM files are handled specially since they have their own embedding workflow
       if (fileType === 'zim') {
-        return await this.processZIMFile(filepath, deleteAfterEmbedding, batchOffset, onProgress)
+        return await this.processZIMFile(filepath, deleteAfterEmbedding, batchOffset, onProgress, collection)
       }
 
       // Extract text based on file type
@@ -764,6 +898,9 @@ export class RagService {
         case 'pdf':
           extractedText = await this.processPDFFile(fileBuffer!)
           break
+        case 'docx':
+          extractedText = await this.processDocxFile(fileBuffer!)
+          break
         case 'epub':
           extractedText = await this.processEPUBFile(fileBuffer!)
           break
@@ -775,12 +912,16 @@ export class RagService {
 
       // Extraction done — scale remaining embedding progress from 15% to 100%
       if (onProgress) await onProgress(15)
-      const scaledProgress = onProgress
-        ? (p: number) => onProgress(15 + p * 0.85)
-        : undefined
+      const scaledProgress = onProgress ? (p: number) => onProgress(15 + p * 0.85) : undefined
 
       // Embed extracted text and cleanup
-      return await this.embedTextAndCleanup(extractedText, filepath, deleteAfterEmbedding, scaledProgress)
+      return await this.embedTextAndCleanup(
+        extractedText,
+        filepath,
+        deleteAfterEmbedding,
+        scaledProgress,
+        collection
+      )
     } catch (error) {
       logger.error('[RAG] Error processing and embedding file:', error)
       return { success: false, message: 'Error processing and embedding file.' }
@@ -794,12 +935,30 @@ export class RagService {
    * @param query - The search query text
    * @param limit - Maximum number of results to return (default: 5)
    * @param scoreThreshold - Minimum similarity score threshold (default: 0.3, much lower than before)
+   * @param minFinalScore - Post-rerank relevance floor; below it a chunk is dropped
    * @returns Array of relevant text chunks with their scores
    */
   public async searchSimilarDocuments(
     query: string,
     limit: number = 5,
-    scoreThreshold: number = 0.3 // Lower default threshold - was 0.7, now 0.3
+    scoreThreshold: number = 0.3, // Lower default threshold - was 0.7, now 0.3
+    collection?: string,
+    /**
+     * Optional sink for the intermediate ranked lists. When supplied, the raw
+     * dense order, the post-rerank order, and the post-diversity order are all
+     * written here. Purely observational — nothing about the returned result
+     * changes — and it is what lets the eval harness answer "is the reranking
+     * heuristic actually helping?" without a second implementation of search.
+     */
+    stagesOut?: RetrievalStages,
+    /**
+     * Relevance floor on the post-rerank score. Defaults to 0 so the parameter
+     * is purely additive for callers that predate it; the chat pipeline and the
+     * eval harness both pass a real value.
+     */
+    minFinalScore: number = 0,
+    /** Optional sink for the floor's counts; see RetrievalFloorStats. */
+    floorOut?: RetrievalFloorStats
   ): Promise<Array<{ text: string; score: number; metadata?: Record<string, any> }>> {
     try {
       logger.debug(`[RAG] Starting similarity search for query: "${query}"`)
@@ -826,9 +985,7 @@ export class RagService {
           allModels.find((model) => model.name.toLowerCase().includes('nomic-embed-text'))
 
         if (!embeddingModel) {
-          logger.warn(
-            `[RAG] ${EMBEDDING_MODEL_NAME} not found. Cannot perform similarity search.`
-          )
+          logger.warn(`[RAG] ${EMBEDDING_MODEL_NAME} not found. Cannot perform similarity search.`)
           this.embeddingModelVerified = false
           return []
         }
@@ -859,7 +1016,10 @@ export class RagService {
         return []
       }
 
-      const response = await this.ollamaService.embed(this.resolvedEmbeddingModel ?? EMBEDDING_MODEL_NAME, [prefixedQuery])
+      const response = await this.ollamaService.embed(
+        this.resolvedEmbeddingModel ?? EMBEDDING_MODEL_NAME,
+        [prefixedQuery]
+      )
 
       // Perform semantic search with a higher limit to enable reranking
       const searchLimit = limit * 3 // Get more results for reranking
@@ -872,6 +1032,13 @@ export class RagService {
         limit: searchLimit,
         score_threshold: scoreThreshold,
         with_payload: true,
+        filter: {
+          // Denylist, not allowlist: a point with no `active` field at all
+          // (not yet backfilled) must still be found by default. Search
+          // correctness must never depend on the backfill's timing.
+          must_not: [{ key: 'active', match: { value: false } }],
+          ...(collection ? { must: [{ key: 'collection', match: { value: collection } }] } : {}),
+        },
       })
 
       logger.debug(`[RAG] Found ${searchResults.length} results above threshold ${scoreThreshold}`)
@@ -891,6 +1058,11 @@ export class RagService {
         document_id: result.payload?.document_id as string | undefined,
         content_type: result.payload?.content_type as string | undefined,
         source: result.payload?.source as string | undefined,
+        // Citation metadata (#1179) -- date/title of the archive a chunk was
+        // extracted from, when known. Undefined for non-ZIM content, which
+        // carries no equivalent embedded metadata.
+        archive_title: result.payload?.archive_title as string | undefined,
+        archive_date: result.payload?.archive_date as string | undefined,
       }))
 
       const rerankedResults = this.rerankResults(resultsWithMetadata, keywords, query)
@@ -902,8 +1074,60 @@ export class RagService {
         )
       })
 
+      // Relevance floor, applied here — after reranking, before diversity.
+      //
+      // The ordering is deliberate. The floor is a judgement about relevance,
+      // and the reranked score is where that judgement is best informed. The
+      // diversity penalty that follows is about redundancy, not relevance: it
+      // multiplies by 0.85^n, so flooring afterwards would drop the fourth chunk
+      // of the one document that actually answers the question and blame a knob
+      // labelled "relevance" for it.
+      const { survivors, belowFloor } = applyRelevanceFloor(rerankedResults, minFinalScore)
+      if (floorOut) {
+        floorOut.candidates = rerankedResults.length
+        floorOut.belowFloor = belowFloor
+      }
+      if (belowFloor > 0) {
+        logger.debug(
+          `[RAG] Relevance floor ${minFinalScore}: dropped ${belowFloor} of ${rerankedResults.length} chunk(s)`
+        )
+      }
+      if (survivors.length === 0 && rerankedResults.length > 0) {
+        // Nothing cleared the bar. Returning empty is the point: the pipeline
+        // then injects no context block at all, rather than handing the model
+        // passages it has to be talked out of using.
+        logger.debug(
+          `[RAG] Nothing cleared the relevance floor (best was ${rerankedResults[0].finalScore.toFixed(4)}) — injecting no context`
+        )
+      }
+
       // Apply source diversity penalty to avoid all results from the same document
-      const diverseResults = this.applySourceDiversity(rerankedResults)
+      const diverseResults = this.applySourceDiversity(survivors)
+
+      // Record the three ranked lists for the eval harness's stage ablation.
+      // Sliced to `limit` so each stage is compared on the window that would
+      // actually have been injected, not on the wider rerank candidate pool.
+      //
+      // `reranked` is recorded pre-floor on purpose: the ablation asks whether
+      // each heuristic *orders* better, and a filter applied to two of the three
+      // lists would answer a different question. The floor's own effect is
+      // measured by sweeping --min-final-score against the headline metrics.
+      if (stagesOut) {
+        const summarize = (rows: Array<{ text: string; score: number; source?: string }>) =>
+          rows.slice(0, limit).map((r) => ({ source: r.source, score: r.score }))
+        stagesOut.dense = summarize(resultsWithMetadata)
+        stagesOut.reranked = rerankedResults
+          .slice(0, limit)
+          .map((r) => ({ source: r.source, score: r.finalScore }))
+        stagesOut.diversified = diverseResults
+          .slice(0, limit)
+          .map((r) => ({ source: r.source, score: r.finalScore }))
+        stagesOut.candidates = rerankedResults.map((r) => ({
+          source: r.source,
+          score: r.finalScore,
+          semanticScore: r.score,
+        }))
+      }
 
       // Return top N results with enhanced metadata
       return diverseResults.slice(0, limit).map((result) => ({
@@ -913,6 +1137,10 @@ export class RagService {
           chunk_index: result.chunk_index,
           created_at: result.created_at,
           semantic_score: result.score,
+          // The originating file/ZIM path. Stored on every point but previously
+          // dropped here, which made it impossible to map a retrieved chunk back
+          // to its document — needed for citations and for recall@k scoring.
+          source: result.source,
           // Enhanced ZIM metadata (likely be undefined for non-ZIM content)
           article_title: result.article_title,
           section_title: result.section_title,
@@ -920,6 +1148,9 @@ export class RagService {
           hierarchy: result.hierarchy,
           document_id: result.document_id,
           content_type: result.content_type,
+          // Citation metadata (#1179)
+          archive_title: result.archive_title,
+          archive_date: result.archive_date,
         },
       }))
     } catch (error) {
@@ -1011,6 +1242,29 @@ export class RagService {
           }
         }
 
+        // Boost when query keywords match the chunk's section/article heading. ZIM
+        // content carries this structural metadata (already fetched, no extra cost),
+        // and a query term appearing in a heading is a strong relevance signal that
+        // body-text matching alone misses. Same conservative, score-scaled, diminishing
+        // -returns shape as the boosts above, so it can't promote a weak match.
+        const headingText = [result.full_title, result.section_title, result.article_title]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+        if (headingText) {
+          const headingHits = queryKeywords.filter((kw) =>
+            headingText.includes(kw.toLowerCase())
+          ).length
+          if (headingHits > 0) {
+            const headingRatio = headingHits / Math.max(queryKeywords.length, 1)
+            const headingBoost = Math.sqrt(headingRatio) * 0.1 * result.score
+            logger.debug(
+              `[RAG] Heading match: ${headingHits}/${queryKeywords.length} - Boost: ${headingBoost.toFixed(3)}`
+            )
+            finalScore += headingBoost
+          }
+        }
+
         finalScore = Math.min(1.0, finalScore + keywordBoost)
 
         return {
@@ -1026,9 +1280,7 @@ export class RagService {
    * Uses greedy selection: for each result, apply 0.85^n penalty where n is the
    * number of results already selected from the same source.
    */
-  private applySourceDiversity(
-    results: Array<RerankedRAGResult>
-  ) {
+  private applySourceDiversity(results: Array<RerankedRAGResult>) {
     const sourceCounts = new Map<string, number>()
     const DIVERSITY_PENALTY = 0.85
 
@@ -1058,7 +1310,10 @@ export class RagService {
    */
   public async hasDocuments(): Promise<boolean> {
     try {
-      await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
+      await this._ensureCollection(
+        RagService.CONTENT_COLLECTION_NAME,
+        RagService.EMBEDDING_DIMENSION
+      )
       const collectionInfo = await this.qdrant!.getCollection(RagService.CONTENT_COLLECTION_NAME)
       return (collectionInfo.points_count ?? 0) > 0
     } catch {
@@ -1084,6 +1339,10 @@ export class RagService {
         key: 'source',
         limit: RagService.FACET_SOURCE_LIMIT,
         exact: true,
+        // Keep the developer eval corpus out of the user's Stored Files list.
+        // It shares this Qdrant collection but is not the user's content, and
+        // its fixture paths would render as broken/missing files in the KB UI.
+        filter: EXCLUDE_EVAL_FILTER,
       })
       for (const hit of facetResult.hits) {
         if (typeof hit.value === 'string') sources.add(hit.value)
@@ -1097,14 +1356,34 @@ export class RagService {
       // in particular) have no row to attach to. The state machine is the
       // authoritative "what's on disk?" view; Qdrant is "what made it into
       // the vector store?". Both are needed to render the KB UI honestly.
-      const stateByPath = new Map<string, { state: KbIngestStateValue; chunks_embedded: number }>()
+      const stateByPath = new Map<
+        string,
+        {
+          state: KbIngestStateValue
+          chunks_embedded: number
+          collection: string | null
+          active: boolean
+        }
+      >()
       try {
-        const stateRows = await KbIngestState.query().select('file_path', 'state', 'chunks_embedded')
+        const stateRows = await KbIngestState.query().select(
+          'file_path',
+          'state',
+          'chunks_embedded',
+          'collection',
+          'active'
+        )
         for (const row of stateRows) {
           sources.add(row.file_path)
           stateByPath.set(row.file_path, {
             state: row.state,
             chunks_embedded: row.chunks_embedded,
+            collection: row.collection,
+            // MySQL hands back tinyint(1) as 0/1, not a boolean. Coerce here so
+            // every consumer sees a real boolean -- the raw 1 reached the DOM as
+            // aria-checked="1", which is not a valid ARIA value and leaves screen
+            // readers with no idea whether the toggle is on.
+            active: Boolean(row.active),
           })
         }
       } catch (error) {
@@ -1116,18 +1395,409 @@ export class RagService {
         )
       }
 
-      return Array.from(sources).map((source) => {
-        const row = stateByPath.get(source)
-        return {
-          source,
-          state: row?.state ?? null,
-          chunksEmbedded: row?.chunks_embedded ?? 0,
-        }
-      })
+      const uploadsAbsPath = resolve(join(process.cwd(), RagService.UPLOADS_STORAGE_PATH))
+      return await Promise.all(
+        Array.from(sources).map(async (source) => {
+          const row = stateByPath.get(source)
+          const fileName = source.split(/[/\\]/).at(-1) ?? source
+          const isUserUpload = resolve(source).startsWith(uploadsAbsPath + sep)
+          const stats = await getFileStatsIfExists(source)
+          return {
+            source,
+            state: row?.state ?? null,
+            chunksEmbedded: row?.chunks_embedded ?? 0,
+            fileName,
+            size: stats?.size ?? null,
+            uploadedAt: stats?.modifiedTime.toISOString() ?? null,
+            isUserUpload,
+            collection: row?.collection ?? null,
+            active: row ? Boolean(row.active) : true,
+          }
+        })
+      )
     } catch (error) {
       logger.error('Error retrieving stored files:', error)
       return []
     }
+  }
+
+  /**
+   * Enumerate distinct `collection` values currently in the knowledge base,
+   * for populating a subject-picker in the upload/chat UI. Mirrors the
+   * `source` facet pattern used elsewhere in this file (see getStoredFiles).
+   */
+  public async getKnowledgeCollections(): Promise<string[]> {
+    await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
+    const facetResult = await this.qdrant!.facet(RagService.CONTENT_COLLECTION_NAME, {
+      key: 'collection',
+      limit: RagService.FACET_SOURCE_LIMIT,
+      exact: true,
+    })
+    const collections = new Set<string>()
+    for (const hit of facetResult.hits) {
+      // The reserved eval tag is internal; never offer it in a subject picker.
+      if (typeof hit.value === 'string' && hit.value !== KB_EVAL_COLLECTION) {
+        collections.add(hit.value)
+      }
+    }
+    return Array.from(collections).sort()
+  }
+
+  /**
+   * Reassign a stored file's collection after the fact. Updates the `collection`
+   * payload field on every existing Qdrant point for this source in place (no
+   * re-chunking or re-embedding needed), then mirrors the change onto the
+   * KbIngestState row so getStoredFiles() reflects it immediately.
+   */
+  public async updateFileCollection(
+    source: string,
+    collection: string | null
+  ): Promise<{ success: boolean; message: string }> {
+    try {
+      await this._ensureCollection(
+        RagService.CONTENT_COLLECTION_NAME,
+        RagService.EMBEDDING_DIMENSION
+      )
+
+      await this.qdrant!.setPayload(RagService.CONTENT_COLLECTION_NAME, {
+        payload: { collection },
+        filter: { must: [{ key: 'source', match: { value: source } }] },
+      })
+
+      // The setPayload above only reaches points that already exist, so for a file
+      // that has not been indexed yet it matches nothing. The row is therefore the
+      // only durable record of the choice until EmbedFileJob picks it up -- create
+      // it when absent rather than reporting success and storing the value nowhere.
+      const row = await KbIngestState.getOrCreate(source)
+      row.collection = collection
+      await row.save()
+
+      return {
+        success: true,
+        message: collection ? `Moved to "${collection}".` : 'Moved to Uncategorized.',
+      }
+    } catch (error) {
+      logger.error('[RAG] Error updating file collection:', error)
+      return { success: false, message: 'Error updating file collection.' }
+    }
+  }
+
+  /**
+   * Toggle a file's active (searchable) state. Writes the KbIngestState row,
+   * then updates the `active` payload field on every existing Qdrant point for
+   * this source in place — no deletion or re-embedding, so this is instant in
+   * either direction. Vectors stay in Qdrant permanently either way; only
+   * `searchSimilarDocuments()`'s query-time filter is affected. See #1119.
+   *
+   * The row goes first so an in-flight embedAndStoreText() call always ends up
+   * with the right value: its post-upsert re-read either sees this write, or
+   * the setPayload below runs after its upsert and covers the new points.
+   */
+  public async setFileActive(
+    source: string,
+    active: boolean
+  ): Promise<{ success: boolean; message: string }> {
+    try {
+      await this._ensureCollection(
+        RagService.CONTENT_COLLECTION_NAME,
+        RagService.EMBEDDING_DIMENSION
+      )
+
+      // A source can have chunks in Qdrant but no state row: a ZIM mid-ingestion
+      // (markIndexed only runs after the final batch), a pre-RFC install, or a
+      // lost row. getStoredFiles() reports such a file as active, so skipping the
+      // write here left the switch stuck on while every point went inactive, and
+      // the user had no way to turn it back on. Create the row the same way the
+      // scanner backfills it: `indexed` when chunks exist, so the file doesn't
+      // regress to pending_decision and get re-dispatched.
+      let row = await KbIngestState.query().where('file_path', source).first()
+      const previousActive = row ? Boolean(row.active) : true
+      if (!row) {
+        const { count } = await this.qdrant!.count(RagService.CONTENT_COLLECTION_NAME, {
+          filter: { must: [{ key: 'source', match: { value: source } }] },
+          exact: false,
+        })
+        row = await KbIngestState.firstOrCreate(
+          { file_path: source },
+          {
+            file_path: source,
+            state: count > 0 ? 'indexed' : 'pending_decision',
+            chunks_embedded: 0,
+            collection: null,
+            active,
+          }
+        )
+      }
+      row.active = active
+      await row.save()
+
+      try {
+        await this.qdrant!.setPayload(RagService.CONTENT_COLLECTION_NAME, {
+          payload: { active },
+          filter: { must: [{ key: 'source', match: { value: source } }] },
+        })
+      } catch (error) {
+        // Put the row back so the panel keeps showing what retrieval does.
+        row.active = previousActive
+        await row.save()
+        throw error
+      }
+
+      return { success: true, message: active ? 'File is now active.' : 'File is now inactive.' }
+    } catch (error) {
+      logger.error('[RAG] Error updating file active state:', error)
+      return { success: false, message: 'Error updating file active state.' }
+    }
+  }
+
+  /**
+   * A source's active flag as a real boolean. MySQL returns tinyint(1) as 0/1,
+   * and a raw 0 stamped into a Qdrant payload slips past the
+   * `must_not: active == false` search filter. A source with no row is active.
+   */
+  private async _readActiveFlag(source: string): Promise<boolean> {
+    const row = await KbIngestState.query().where('file_path', source).first()
+    return row ? Boolean(row.active) : true
+  }
+
+  /**
+   * Toggle every file tagged with a KB collection (the personal-upload
+   * `collection` field -- not the unrelated curated ZIM-pack "collections"
+   * feature) active/inactive in one bulk operation, mirroring the
+   * collection-scoped bulk writes in renameKnowledgeCollection/
+   * deleteKnowledgeCollection rather than looping setFileActive() per file.
+   * `collection: null` targets the "Uncategorized" bucket.
+   *
+   * Returns the count of files whose active value actually changed (not the
+   * collection's total membership), so the caller can report accurate scope
+   * for what is otherwise an opaque bulk action -- e.g. "Turned off 9 files",
+   * not "Turned off 12" when 3 were already inactive.
+   */
+  public async setKnowledgeCollectionActive(
+    collection: string | null,
+    active: boolean
+  ): Promise<{ success: boolean; message: string; affectedCount: number }> {
+    try {
+      await this._ensureCollection(
+        RagService.CONTENT_COLLECTION_NAME,
+        RagService.EMBEDDING_DIMENSION
+      )
+
+      const collectionQuery = () =>
+        collection === null
+          ? KbIngestState.query().whereNull('collection')
+          : KbIngestState.query().where('collection', collection)
+
+      const collectionFilterClause =
+        collection === null
+          ? { is_empty: { key: 'collection' } }
+          : { key: 'collection', match: { value: collection } }
+
+      // Rows before Qdrant, for the same reason as setFileActive(). Only rows
+      // that change are touched, so a failed setPayload can restore exactly
+      // those without flipping files that already held the target value.
+      const changedPaths = (
+        await collectionQuery().where('active', !active).select('file_path')
+      ).map((r) => r.file_path)
+      const affectedCount = changedPaths.length
+      await collectionQuery().update({ active })
+
+      try {
+        await this.qdrant!.setPayload(RagService.CONTENT_COLLECTION_NAME, {
+          payload: { active },
+          filter: { must: [collectionFilterClause] },
+        })
+      } catch (error) {
+        if (changedPaths.length > 0) {
+          await KbIngestState.query().whereIn('file_path', changedPaths).update({ active: !active })
+        }
+        throw error
+      }
+
+      const label = collection ?? 'Uncategorized'
+      const verb = active ? 'Turned on' : 'Turned off'
+      return {
+        success: true,
+        message: `${verb} ${affectedCount} file${affectedCount === 1 ? '' : 's'} in "${label}".`,
+        affectedCount,
+      }
+    } catch (error) {
+      logger.error('[RAG] Error updating KB collection active state:', error)
+      return {
+        success: false,
+        message: 'Error updating collection active state.',
+        affectedCount: 0,
+      }
+    }
+  }
+
+  /**
+   * Rename a knowledge-base collection everywhere it's referenced: updates every
+   * Qdrant point tagged with the old name in place, and mirrors the change onto
+   * any matching KbIngestState rows so getStoredFiles() reflects it immediately.
+   */
+  public async renameKnowledgeCollection(
+    oldName: string,
+    newName: string
+  ): Promise<{ success: boolean; message: string }> {
+    try {
+      if (!oldName || !newName || oldName === newName) {
+        return { success: false, message: 'Invalid collection names.' }
+      }
+      await this._ensureCollection(
+        RagService.CONTENT_COLLECTION_NAME,
+        RagService.EMBEDDING_DIMENSION
+      )
+
+      await this.qdrant!.setPayload(RagService.CONTENT_COLLECTION_NAME, {
+        payload: { collection: newName },
+        filter: { must: [{ key: 'collection', match: { value: oldName } }] },
+      })
+
+      await KbIngestState.query().where('collection', oldName).update({ collection: newName })
+
+      return { success: true, message: `Renamed "${oldName}" to "${newName}".` }
+    } catch (error) {
+      logger.error('[RAG] Error renaming knowledge collection:', error)
+      return { success: false, message: 'Error renaming collection.' }
+    }
+  }
+
+  /**
+   * Remove a collection by reassigning every file tagged with it back to
+   * Uncategorized (collection: null). Non-destructive — no files or embeddings
+   * are deleted, only the grouping label is cleared so items can be
+   * recategorized later.
+   */
+  public async deleteKnowledgeCollection(
+    name: string
+  ): Promise<{ success: boolean; message: string }> {
+    try {
+      if (!name) {
+        return { success: false, message: 'Invalid collection name.' }
+      }
+      await this._ensureCollection(
+        RagService.CONTENT_COLLECTION_NAME,
+        RagService.EMBEDDING_DIMENSION
+      )
+
+      await this.qdrant!.setPayload(RagService.CONTENT_COLLECTION_NAME, {
+        payload: { collection: null },
+        filter: { must: [{ key: 'collection', match: { value: name } }] },
+      })
+
+      await KbIngestState.query().where('collection', name).update({ collection: null })
+
+      return { success: true, message: `"${name}" removed. Files moved to Uncategorized.` }
+    } catch (error) {
+      logger.error('[RAG] Error deleting knowledge collection:', error)
+      return { success: false, message: 'Error deleting collection.' }
+    }
+  }
+
+  /**
+   * Count the points carrying a given `collection` tag.
+   *
+   * Distinct from the facet-based counts above, which deliberately exclude
+   * internal collections. This answers "how many chunks are in exactly this
+   * collection", which is what the eval harness needs to confirm an ingest
+   * landed and what a future per-collection UI would want.
+   */
+  public async countChunksInCollection(collection: string): Promise<number> {
+    await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
+    const result = await this.qdrant!.count(RagService.CONTENT_COLLECTION_NAME, {
+      filter: { must: [{ key: 'collection', match: { value: collection } }] },
+      exact: true,
+    })
+    return result.count
+  }
+
+  /**
+   * Hard-delete every point carrying a given `collection` tag.
+   *
+   * Note this is NOT what `deleteKnowledgeCollection` does — that one clears the
+   * tag and leaves the user's documents in place, because deleting a user's
+   * content because they renamed a folder would be indefensible. This one
+   * genuinely removes the points, and exists for the eval corpus, which is
+   * disposable by construction. Returns the number of points removed.
+   */
+  public async deleteCollectionPoints(collection: string): Promise<number> {
+    await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
+    const before = await this.countChunksInCollection(collection)
+    if (before === 0) return 0
+    await this.qdrant!.delete(RagService.CONTENT_COLLECTION_NAME, {
+      wait: true,
+      filter: { must: [{ key: 'collection', match: { value: collection } }] },
+    })
+    return before
+  }
+
+  /**
+   * Resolve a stored-file `source` to an absolute disk path, but only if the
+   * path lives under the uploads directory. Mirrors the docs_service traversal
+   * guard: resolve, then require the resolved path to be strictly inside the
+   * base + path separator (so siblings of `kb_uploads` can't slip through).
+   * Returns null for anything else — ZIMs, admin docs, README, or paths
+   * outside the app entirely. The viewer/download endpoints lean on this so
+   * they don't need to repeat the check.
+   */
+  private resolveUploadPath(source: string): string | null {
+    const uploadsAbsPath = resolve(join(process.cwd(), RagService.UPLOADS_STORAGE_PATH))
+    const resolved = resolve(source)
+    if (!resolved.startsWith(uploadsAbsPath + sep)) return null
+    return resolved
+  }
+
+  private static readonly VIEWABLE_TEXT_EXTENSIONS: ReadonlySet<string> = new Set([
+    'md',
+    'txt',
+    'csv',
+    'json',
+    'yaml',
+    'yml',
+    'toml',
+    'xml',
+    'html',
+  ])
+
+  /**
+   * Read the text content of a user-uploaded file for in-browser viewing.
+   * Returns null when the source is outside uploads, missing, or not a
+   * recognized text extension. The extension allowlist is intentionally narrow
+   * — PDFs/EPUBs/ZIMs round-trip through Download, not the viewer.
+   */
+  public async readFileContent(
+    source: string
+  ): Promise<{ content: string; extension: string; fileName: string } | null> {
+    const resolved = this.resolveUploadPath(source)
+    if (!resolved) return null
+
+    const extension = resolved.split('.').at(-1)?.toLowerCase() ?? ''
+    if (!RagService.VIEWABLE_TEXT_EXTENSIONS.has(extension)) return null
+
+    const stats = await getFileStatsIfExists(resolved)
+    if (!stats) return null
+
+    try {
+      const { readFile } = await import('node:fs/promises')
+      const content = await readFile(resolved, 'utf-8')
+      const fileName = resolved.split(/[/\\]/).at(-1) ?? resolved
+      return { content, extension, fileName }
+    } catch (error) {
+      logger.warn({ err: error, source }, '[RagService.readFileContent] read failed')
+      return null
+    }
+  }
+
+  /**
+   * Resolve a download-target path for a stored upload. Returns null if the
+   * source isn't an upload or the file is missing on disk.
+   */
+  public async resolveDownloadPath(source: string): Promise<string | null> {
+    const resolved = this.resolveUploadPath(source)
+    if (!resolved) return null
+    const stats = await getFileStatsIfExists(resolved)
+    return stats ? resolved : null
   }
 
   /**
@@ -1187,6 +1857,9 @@ export class RagService {
         key: 'source',
         limit: RagService.FACET_SOURCE_LIMIT,
         exact: true,
+        // Same exclusion as getStoredFiles: eval fixtures are not user files,
+        // and counting them here would raise bogus zero_chunks warnings.
+        filter: EXCLUDE_EVAL_FILTER,
       })
       for (const hit of facetResult.hits) {
         if (typeof hit.value === 'string') chunksBySource.set(hit.value, hit.count)
@@ -1219,9 +1892,16 @@ export class RagService {
         const fileSizeBytes = sizeByPath.get(source) ?? 0
         const chunksInQdrant = chunksBySource.get(source) ?? 0
         const fileName = source.split(/[/\\]/).pop() ?? source
+        // ignoreCatchAll: the partial_stall warning must only fire when the
+        // registry has a *specific* expectation for this file. The empty-pattern
+        // fallback (100 chunks/MB) over-predicts wildly for atypical ZIMs that
+        // are mostly PDFs/images/link-outs (e.g. military-medicine), producing
+        // false "ingestion stalled" warnings. Suppress Warning B in that case. (#913)
         const expectedChunks =
           fileSizeBytes > 0
-            ? await KbRatioRegistry.estimateChunks(fileName, fileSizeBytes)
+            ? await KbRatioRegistry.estimateChunks(fileName, fileSizeBytes, {
+                ignoreCatchAll: true,
+              })
             : null
 
         const warnings = decideWarnings({ fileSizeBytes, chunksInQdrant, expectedChunks })
@@ -1256,17 +1936,19 @@ export class RagService {
       logger.info(`[RAG] Deleted all points for source: ${source}`)
 
       /** Delete the physical file only if it lives inside the uploads directory.
-      * resolve() normalises path traversal sequences (e.g. "/../..") before the
-      * check to prevent path traversal vulns
-      * The trailing sep is to ensure a prefix like "kb_uploads_{something_incorrect}" can't slip through.
-      */
+       * resolve() normalises path traversal sequences (e.g. "/../..") before the
+       * check to prevent path traversal vulns
+       * The trailing sep is to ensure a prefix like "kb_uploads_{something_incorrect}" can't slip through.
+       */
       const uploadsAbsPath = join(process.cwd(), RagService.UPLOADS_STORAGE_PATH)
       const resolvedSource = resolve(source)
       if (resolvedSource.startsWith(uploadsAbsPath + sep)) {
         await deleteFileIfExists(resolvedSource)
         logger.info(`[RAG] Deleted uploaded file from disk: ${resolvedSource}`)
       } else {
-        logger.warn(`[RAG] File was removed from knowledge base but doesn't live in Nomad's uploads directory, so it can't be safely removed. Skipping deletion of physical file...`)
+        logger.warn(
+          `[RAG] File was removed from knowledge base but doesn't live in Nomad's uploads directory, so it can't be safely removed. Skipping deletion of physical file...`
+        )
       }
 
       // Drop the ingest state row last so the file disappears entirely. Without
@@ -1281,15 +1963,122 @@ export class RagService {
     }
   }
 
+  /**
+   * Reconcile the knowledge base after a curated content file (a ZIM) is
+   * replaced on disk by a newer downloaded version. Called from
+   * `RunDownloadJob.onComplete` once the new file is written and the old file
+   * has been deleted from disk.
+   *
+   * The decision (see `decideContentReindex` for the exhaustive, tested
+   * contract) mirrors the REPLACED file's prior indexed state instead of the
+   * global `rag.defaultIngestPolicy`. On a content update the user has already
+   * chosen whether this content belongs in the AI knowledge base, so we honor
+   * that choice in both directions:
+   *
+   *   1. (caller already deleted the outdated file from disk)
+   *   2. Qdrant not installed          → no-op (no knowledge base exists)
+   *   3. Old file WAS indexed + Qdrant
+   *      running                       → delete ONLY the old file's points
+   *                                       (filter `source == oldFilePath`), drop
+   *                                       its ingest-state row, and queue the new
+   *                                       file for embedding — BYPASSING the
+   *                                       Always/Manual policy on purpose.
+   *   4. Old file NOT indexed          → no-op (respect the prior un-indexed /
+   *                                       browse-only choice; do NOT auto-embed
+   *                                       even under an Always policy)
+   *   5. Old indexed but Qdrant NOT
+   *      currently running             → no-op. We can't remove the stale points,
+   *                                       and a queued embed job could be cleared
+   *                                       before Qdrant returns. Acting half-way is
+   *                                       wasteful, so we defer entirely. Accepted
+   *                                       tradeoff: the old file's points linger in
+   *                                       Qdrant until a future re-index; they are
+   *                                       NOT auto-reaped here.
+   *
+   * Point deletion is exact: ZIM chunks are stored with `source` equal to the
+   * full file path (see embedAndStoreText callers), so filtering on the old path
+   * can only ever remove the replaced file's own points.
+   *
+   * Returns the decision outcome for logging/tests; never throws on a Qdrant
+   * hiccup mid-reindex (logged and surfaced as `qdrant_not_running` semantics by
+   * the caller's try/catch).
+   */
+  public async reconcileReplacedContentFile(params: {
+    oldFilePath: string
+    newFilePath: string
+    fileName: string
+  }): Promise<ReindexOutcome> {
+    const { oldFilePath, newFilePath, fileName } = params
+
+    const isReplacement = !!oldFilePath && oldFilePath !== newFilePath
+
+    // Step 2: is the knowledge base even installed? Short-circuits before any
+    // KB-state lookup, per the spec ordering.
+    const qdrantInstalled = isReplacement
+      ? !!(await this.dockerService.getServiceURL(SERVICE_NAMES.QDRANT))
+      : false
+
+    // Steps 3/4: was the OUTDATED file actually indexed? The state row is the
+    // authoritative signal (RFC #883) — chunk presence alone can't distinguish
+    // a fully-indexed file from a stalled ingestion.
+    let oldFileWasIndexed = false
+    if (isReplacement && qdrantInstalled) {
+      const oldState = await KbIngestState.query().where('file_path', oldFilePath).first()
+      oldFileWasIndexed = oldState?.state === 'indexed'
+    }
+
+    // Step 5: only check liveness once we know we'd otherwise act. The health
+    // check is a real network round-trip, so we avoid it on the common no-op
+    // paths above.
+    let qdrantRunning = false
+    if (isReplacement && qdrantInstalled && oldFileWasIndexed) {
+      qdrantRunning = (await this.checkQdrantHealth()).online
+    }
+
+    const outcome = decideContentReindex({
+      isReplacement,
+      qdrantInstalled,
+      oldFileWasIndexed,
+      qdrantRunning,
+    })
+
+    if (outcome === 'reindex') {
+      // Order matters: remove the stale points and state row BEFORE queueing the
+      // new embed so a fresh index can't be conflated with the old one. Each step
+      // targets only `oldFilePath` / `newFilePath` — never another resource.
+      await this.purgeIndexedSource(oldFilePath)
+      const { EmbedFileJob } = await import('#jobs/embed_file_job')
+      await EmbedFileJob.dispatch({ fileName, filePath: newFilePath })
+    }
+
+    return outcome
+  }
+
+  /**
+   * Root paths for Nomad's own bundled docs (README.md + docs/), embedded by
+   * discoverNomadDocs(). They live outside kb_uploads/zim storage, so
+   * _discoverKbFiles()'s scan never sees them — the orphan sweep in
+   * scanAndSyncStorage() uses this to exclude them rather than hardcoding
+   * the same two paths a second time.
+   */
+  private _nomadDocsRoots(): { readmePath: string; docsDir: string } {
+    return {
+      readmePath: join(process.cwd(), 'README.md'),
+      docsDir: join(process.cwd(), 'docs'),
+    }
+  }
+
   public async discoverNomadDocs(force?: boolean): Promise<{ success: boolean; message: string }> {
     try {
-      const README_PATH = join(process.cwd(), 'README.md')
-      const DOCS_DIR = join(process.cwd(), 'docs')
+      const { readmePath: README_PATH, docsDir: DOCS_DIR } = this._nomadDocsRoots()
 
       const alreadyEmbeddedRaw = await KVStore.getValue('rag.docsEmbedded')
       if (alreadyEmbeddedRaw && !force) {
         logger.info('[RAG] Nomad docs have already been discovered and queued. Skipping.')
-        return { success: true, message: 'Nomad docs have already been discovered and queued. Skipping.' }
+        return {
+          success: true,
+          message: 'Nomad docs have already been discovered and queued. Skipping.',
+        }
       }
 
       const filesToEmbed: Array<{ path: string; source: string }> = []
@@ -1321,20 +2110,36 @@ export class RagService {
           })
           logger.info(`[RAG] Successfully dispatched job for ${fileInfo.source}`)
         } catch (fileError) {
-          logger.error(
-            `[RAG] Error dispatching job for file ${fileInfo.source}:`,
-            fileError
-          )
+          logger.error(`[RAG] Error dispatching job for file ${fileInfo.source}:`, fileError)
         }
       }
 
       // Update KV store to mark docs as discovered so we don't redo this unnecessarily
       await KVStore.setValue('rag.docsEmbedded', true)
 
-      return { success: true, message: `Nomad docs discovery completed. Dispatched ${filesToEmbed.length} embedding jobs.` }
+      return {
+        success: true,
+        message: `Nomad docs discovery completed. Dispatched ${filesToEmbed.length} embedding jobs.`,
+      }
     } catch (error) {
       logger.error('Error discovering Nomad docs:', error)
       return { success: false, message: 'Error discovering Nomad docs.' }
+    }
+  }
+
+  /**
+   * Absolute roots that _discoverKbFiles() scans. Shared with the orphan
+   * sweep in scanAndSyncStorage() so it can allowlist candidates to sources
+   * actually reachable by that scan, rather than denylisting every other
+   * known source root by hand — a source embedded under a future root
+   * outside kb_uploads/zim would otherwise be silently misclassified as
+   * orphaned and purged the first time it's added (see _nomadDocsRoots()
+   * for exactly that lesson learned with README.md/docs).
+   */
+  private _kbScanRoots(): { kbUploadsPath: string; zimPath: string } {
+    return {
+      kbUploadsPath: join(process.cwd(), RagService.UPLOADS_STORAGE_PATH),
+      zimPath: join(process.cwd(), ZIM_STORAGE_PATH),
     }
   }
 
@@ -1345,9 +2150,37 @@ export class RagService {
    * type" and retry on every sync.
    */
   private async _discoverKbFiles(): Promise<string[]> {
-    const KB_UPLOADS_PATH = join(process.cwd(), RagService.UPLOADS_STORAGE_PATH)
-    const ZIM_PATH = join(process.cwd(), ZIM_STORAGE_PATH)
+    return (await this._discoverKbFilesWithRoots()).files
+  }
+
+  /**
+   * As _discoverKbFiles(), but also reports which roots were actually walked.
+   *
+   * A root that isn't there is skipped rather than fatal, because a fresh
+   * install legitimately has no kb_uploads until the first upload. That makes
+   * an absent root indistinguishable from a present-but-empty one by looking
+   * at the file list alone — and the orphan sweep in scanAndSyncStorage()
+   * cannot afford to confuse the two. "This root wasn't there" means we know
+   * nothing about it and must not touch it. A root that was there but empty
+   * is not much better evidence: boot creates the zim directory, so an
+   * unmounted volume shows up as an empty one (#1378). decideOrphans()
+   * therefore also refuses to purge under a walked root with no files.
+   *
+   * That distinction is the whole reason this variant exists. If the zim root
+   * is missing, renamed, or not yet mounted (see #1050 — relocating the data
+   * path is easy to get subtly wrong), the scan still returns a non-empty
+   * list from kb_uploads. A guard that only checks "did the scan come back
+   * empty" therefore passes, and every ZIM in the index gets purged in one
+   * batch. Reporting the roots lets the sweep confine itself to ground it
+   * actually stood on.
+   */
+  private async _discoverKbFilesWithRoots(): Promise<{
+    files: string[]
+    scannedRoots: string[]
+  }> {
+    const { kbUploadsPath: KB_UPLOADS_PATH, zimPath: ZIM_PATH } = this._kbScanRoots()
     const filesInStorage: string[] = []
+    const scannedRoots: string[] = []
 
     for (const [label, dirPath] of [
       [RagService.UPLOADS_STORAGE_PATH, KB_UPLOADS_PATH] as const,
@@ -1358,6 +2191,7 @@ export class RagService {
         contents.forEach((entry) => {
           if (entry.type === 'file') filesInStorage.push(entry.key)
         })
+        scannedRoots.push(dirPath)
         logger.debug(`[RAG] Found ${contents.length} files in ${label}`)
       } catch (error) {
         if (error.code === 'ENOENT') {
@@ -1368,7 +2202,10 @@ export class RagService {
       }
     }
 
-    return filesInStorage.filter((f) => determineFileType(f) !== 'unknown')
+    return {
+      files: filesInStorage.filter((f) => determineFileType(f) !== 'unknown'),
+      scannedRoots,
+    }
   }
 
   /**
@@ -1450,7 +2287,8 @@ export class RagService {
       return {
         success: false,
         code: 'inflight',
-        message: 'A job for this file is already in progress. Wait for it to finish before re-queuing.',
+        message:
+          'A job for this file is already in progress. Wait for it to finish before re-queuing.',
       }
     }
 
@@ -1487,13 +2325,53 @@ export class RagService {
    * by reembedAll() where the file must remain so it can be re-ingested.
    */
   private async _deletePointsBySource(source: string): Promise<void> {
-    await this._ensureCollection(
-      RagService.CONTENT_COLLECTION_NAME,
-      RagService.EMBEDDING_DIMENSION
-    )
+    await this._deletePointsBySources([source])
+  }
+
+  /**
+   * Same as _deletePointsBySource(), but for many sources in one round trip
+   * via Qdrant's `match.any` filter — used by the orphan sweep below, where
+   * purging one-by-one would mean a separate delete call (plus a separate
+   * _ensureCollection check) per orphan.
+   */
+  private async _deletePointsBySources(sources: string[]): Promise<void> {
+    if (sources.length === 0) return
+    await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
     await this.qdrant!.delete(RagService.CONTENT_COLLECTION_NAME, {
-      filter: { must: [{ key: 'source', match: { value: source } }] },
+      filter: { must: [{ key: 'source', match: { any: sources } }] },
     })
+  }
+
+  /**
+   * Purge a source's Qdrant points and its `KbIngestState` row without
+   * touching the file on disk. For callers where the file is already gone
+   * (or never existed as a knowledge-base upload) — `ZimService.delete()`
+   * (#1170) and the orphan sweep in `scanAndSyncStorage()` below. Does NOT
+   * attempt to delete a physical file; use `deleteFileBySource()` for the
+   * user-triggered "remove this file" action instead.
+   *
+   * State row removed first, points second: orphan detection in
+   * scanAndSyncStorage() only looks at what's still in Qdrant, so if a
+   * failure lands between the two steps, leftover points stay visible to
+   * the next sync's reverse sweep and get retried there. Deleting the
+   * points first would instead risk an orphaned state row that nothing
+   * ever looks at again. Both steps are individually idempotent, so a
+   * retry from either partial state is safe.
+   */
+  public async purgeIndexedSource(source: string): Promise<void> {
+    await this.purgeIndexedSources([source])
+  }
+
+  /**
+   * Batched form of purgeIndexedSource() — one KbIngestState delete query
+   * and one Qdrant delete call for the whole list, instead of a per-source
+   * round trip to each. Used by the orphan sweep in scanAndSyncStorage(),
+   * which can otherwise find dozens of orphans after a bulk content change.
+   */
+  public async purgeIndexedSources(sources: string[]): Promise<void> {
+    if (sources.length === 0) return
+    await KbIngestState.query().whereIn('file_path', sources).delete()
+    await this._deletePointsBySources(sources)
   }
 
   /**
@@ -1507,7 +2385,10 @@ export class RagService {
     const { QueueService } = await import('#services/queue_service')
     const queue = QueueService.getInstance().getQueue(EmbedFileJob.queue)
     const counts = await queue.getJobCounts('waiting', 'active', 'delayed', 'paused')
-    return (counts.waiting || 0) + (counts.active || 0) + (counts.delayed || 0) + (counts.paused || 0) > 0
+    return (
+      (counts.waiting || 0) + (counts.active || 0) + (counts.delayed || 0) + (counts.paused || 0) >
+      0
+    )
   }
 
   /**
@@ -1528,7 +2409,7 @@ export class RagService {
         logger.error('[RAG] Error during Nomad docs discovery in sync process:', error)
       })
 
-      const filesInStorage = await this._discoverKbFiles()
+      const { files: filesInStorage, scannedRoots } = await this._discoverKbFilesWithRoots()
       logger.info(`[RAG] Found ${filesInStorage.length} embeddable files in storage`)
 
       await this._ensureCollection(
@@ -1564,6 +2445,48 @@ export class RagService {
       const embeddableFiles = filesInStorage.filter(
         (filePath) => determineFileType(filePath) !== 'unknown'
       )
+
+      // Reverse sweep (#1170): sourcesInQdrant and embeddableFiles are both
+      // already known at this point — the forward loop below only ever asks
+      // "is this on-disk file already embedded?" This closes the other
+      // direction: a source in Qdrant with no corresponding file on disk is a
+      // leftover from ZimService.delete() (which never touched Qdrant) or
+      // from reconcileReplacedContentFile's qdrant_not_running no-op. Running
+      // this in sync (rather than only in the delete path) also self-heals
+      // installs already in this state.
+      //
+      // Confined to `scannedRoots`, the roots the scan above actually walked,
+      // not the roots it meant to walk. Nomad's own bundled docs (README.md +
+      // docs/) live outside these roots, so they're left alone without being
+      // named here, and a root missing at scan time contributes nothing
+      // (#1050). Within each walked root, decideOrphans also withholds the
+      // purge when the root holds no embeddable files (an unmounted volume
+      // leaves an empty mountpoint behind, #1378) or when it would remove most
+      // of the root at once. Withheld roots are reported back to the operator
+      // rather than silently skipped.
+      const { orphans, withheld } = decideOrphans(
+        [...sourcesInQdrant],
+        embeddableFiles,
+        scannedRoots
+      )
+      for (const w of withheld) {
+        logger.warn(
+          `[RAG] Withheld purge of ${w.count} indexed source(s) under ${w.root} (${w.reason}); the directory may be unmounted or pointing at the wrong location`
+        )
+      }
+      let orphansPurged = 0
+      if (orphans.length > 0) {
+        logger.info(
+          `[RAG] Found ${orphans.length} orphaned source(s) with no corresponding file on disk`
+        )
+        try {
+          await this.purgeIndexedSources(orphans)
+          orphansPurged = orphans.length
+        } catch (error) {
+          logger.error(`[RAG] Failed to purge orphaned sources:`, error)
+        }
+        logger.info(`[RAG] Purged ${orphansPurged}/${orphans.length} orphaned source(s)`)
+      }
 
       // Read the global ingest policy. Unset is treated as 'Always' so legacy
       // installs keep their current behavior until the user explicitly opts
@@ -1625,10 +2548,25 @@ export class RagService {
         `[RAG] Scan results (policy=${policy}): ${filesToEmbed.length} to embed, ${backfilled} backfilled, ${createdRows} new pending, ${createdPending} waiting on user, ${skipped} skipped`
       )
 
+      const withheldNote = withheld
+        .map(
+          (w) =>
+            `; left ${w.count} indexed source${w.count !== 1 ? 's' : ''} under ${relative(process.cwd(), w.root)} untouched because ${
+              w.reason === 'empty_root'
+                ? 'that folder has no files (is the drive mounted?)'
+                : 'removing them would clear most of that folder (is it pointing at the right drive?)'
+            }`
+        )
+        .join('')
+      const orphanNote =
+        (orphansPurged > 0
+          ? `; purged ${orphansPurged} orphaned source${orphansPurged !== 1 ? 's' : ''}`
+          : '') + withheldNote
+
       if (filesToEmbed.length === 0) {
         return {
           success: true,
-          message: 'Knowledge base is already in sync',
+          message: `Knowledge base is already in sync${orphanNote}`,
           filesScanned: filesInStorage.length,
           filesQueued: 0,
         }
@@ -1638,7 +2576,7 @@ export class RagService {
       const dedupeNote = dedupedCount > 0 ? ` (${dedupedCount} already queued)` : ''
       return {
         success: true,
-        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding${dedupeNote}`,
+        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding${dedupeNote}${orphanNote}`,
         filesScanned: filesInStorage.length,
         filesQueued: queuedCount,
       }
@@ -1668,7 +2606,8 @@ export class RagService {
       if (await this._hasInflightEmbedJobs()) {
         return {
           success: false,
-          message: 'Embed jobs are already in progress. Wait for the queue to drain (or clean up failed jobs) before triggering a bulk re-embed.',
+          message:
+            'Embed jobs are already in progress. Wait for the queue to drain (or clean up failed jobs) before triggering a bulk re-embed.',
         }
       }
 
@@ -1701,7 +2640,10 @@ export class RagService {
         try {
           await this._deletePointsBySource(filePath)
         } catch (err) {
-          logger.error(`[RAG] Failed to delete prior points for ${filePath}; skipping dispatch:`, err)
+          logger.error(
+            `[RAG] Failed to delete prior points for ${filePath}; skipping dispatch:`,
+            err
+          )
           failedPaths.push(filePath)
           continue
         }
@@ -1716,7 +2658,10 @@ export class RagService {
         } catch (fileError) {
           // Old points already deleted but the new job never made it onto the
           // queue. Logged + surfaced so an operator can rerun a sync.
-          logger.error(`[RAG] Re-embed dispatch failed for ${filePath} after delete; file is now unindexed until next sync:`, fileError)
+          logger.error(
+            `[RAG] Re-embed dispatch failed for ${filePath} after delete; file is now unindexed until next sync:`,
+            fileError
+          )
           failedPaths.push(filePath)
         }
       }
@@ -1765,7 +2710,8 @@ export class RagService {
       if (await this._hasInflightEmbedJobs()) {
         return {
           success: false,
-          message: 'Embed jobs are already in progress. Wait for the queue to drain (or clean up failed jobs) before triggering a reset.',
+          message:
+            'Embed jobs are already in progress. Wait for the queue to drain (or clean up failed jobs) before triggering a reset.',
         }
       }
 
@@ -1779,6 +2725,10 @@ export class RagService {
         // Collection may not exist yet on a fresh install — log and continue.
         logger.warn(`[RAG] deleteCollection failed (may not exist): ${(err as Error).message}`)
       }
+
+      // The collection is gone — drop it from the ensured cache so the
+      // _ensureCollection call below actually recreates it
+      this.ensuredCollections.delete(RagService.CONTENT_COLLECTION_NAME)
 
       await this._ensureCollection(
         RagService.CONTENT_COLLECTION_NAME,
