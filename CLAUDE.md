@@ -111,8 +111,8 @@ These are Docker containers managed by the Command Center UI:
 ## Conventions
 
 - **Conventional Commits**: `feat(scope):`, `fix(scope):`, `docs:`, `refactor:`, `chore:`, `test:`
-- **Branching**: Feature branches off `dev` (e.g., `fix/issue-123`, `feature/add-new-tool`). PRs target `dev`.
-- **Versioning**: Root `package.json` version managed by semantic-release. `admin/package.json` stays at `0.0.0` — do not change it.
+- **Branching**: Both platforms use the fork’s `main`. Use short-lived integration branches and target pull requests at BigMoonTech/project-nomad-wsl.
+- **Versioning**: Use the fork numbering and manual release workflows in `docs/MAINTAINER_PLAYBOOK.md`. `admin/package.json` stays at `0.0.0` — do not change it.
 - **Release notes**: Maintained in `admin/docs/release-notes.md` by maintainers, not in PRs.
 - **Module imports**: Use `#` subpath imports (e.g., `#services/docker_service`, `#models/service`). Defined in `admin/package.json` `imports` field.
 

@@ -12,11 +12,12 @@ daemon_up=true
 compose_up=true
 runtime=yes
 mock_socket=local
+mock_arch=aarch64
 docker() {
   case "$*" in
     'info --format {{.OperatingSystem}}') $daemon_up && echo "$mock_engine" ;;
     'info --format {{.OSType}}') echo linux ;;
-    'info --format {{.Architecture}}') echo aarch64 ;;
+    'info --format {{.Architecture}}') echo "$mock_arch" ;;
     'info --format {{.ID}}') echo local ;;
     '--host unix:///var/run/docker.sock info --format {{.ID}}') echo "$mock_socket" ;;
     'info --format {{if index .Runtimes "nvidia"}}yes{{end}}') echo "$runtime" ;;
@@ -26,7 +27,9 @@ docker() {
   esac
 }
 expect_failure() {
-  if ( "$@" ); then echo "Expected $* to fail" >&2; exit 1; fi
+  local status=0
+  ( "$@" ) || status=$?
+  if [[ $status != 1 ]]; then echo "Expected a handled failure for $* (got $status)" >&2; exit 1; fi
 }
 for test_arch in aarch64 arm64 amd64 x86_64; do
   uname() { echo "$test_arch"; }
@@ -39,6 +42,9 @@ IS_WSL=true
 mock_engine='Docker Desktop'
 ensure_docker_installed
 check_docker_compose
+[[ $DOCKER_DEFAULT_PLATFORM == linux/arm64 ]]
+( mock_arch=x86_64; ensure_docker_installed; [[ $DOCKER_DEFAULT_PLATFORM == linux/amd64 ]] )
+( mock_arch=armv7l; expect_failure ensure_docker_installed )
 ( unset -f docker; PATH="$fixture"; expect_failure ensure_docker_installed )
 ( daemon_up=false; expect_failure ensure_docker_installed )
 ( compose_up=false; expect_failure check_docker_compose )
@@ -52,7 +58,7 @@ mock_engine='Ubuntu'
 ensure_docker_installed
 ( daemon_up=false; sudo() { [[ $* == 'systemctl start docker' ]]; daemon_up=true; }; ensure_docker_installed )
 ( compose_up=false; apt-cache() { [[ $* == 'show docker-compose-plugin' ]]; }
-  sudo() { [[ $* == 'apt-get install -y docker-compose-plugin' ]]; compose_up=true; }; check_docker_compose )
+  sudo() { [[ $* == 'apt-get update' ]] || { [[ $* == 'apt-get install -y docker-compose-plugin' ]] && compose_up=true; }; }; check_docker_compose )
 ( PATH="$fixture"; setup_nvidia_container_toolkit ) # CPU-only host
 ( nvidia-smi() { return 0; }; setup_nvidia_container_toolkit ) # Ready GB10
 ( runtime=''; nvidia-smi() { return 0; }; nvidia-ctk() { :; }; sleep() { :; }

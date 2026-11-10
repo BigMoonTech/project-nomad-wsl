@@ -68,6 +68,7 @@ test('unknown backend image rejection returns actionable compatibility details o
     send: () => undefined,
   }
   const ollamaService = {
+    getModelInfo: async () => ({ hasThinking: false, modelfileSamplers: {} }),
     getModelCapabilities: async () => ({ thinking: false, vision: 'unknown' as const }),
     chatStream: async () => {
       throw new Error('The upstream backend rejected image_url content.')
@@ -157,6 +158,7 @@ test('unknown backend image rejection returns actionable compatibility details w
     },
   }
   const ollamaService = {
+    getModelInfo: async () => ({ hasThinking: false, modelfileSamplers: {} }),
     getModelCapabilities: async () => ({ thinking: false, vision: 'unknown' as const }),
     chat: async () => {
       throw new Error('The upstream backend rejected image_url content.')
@@ -240,6 +242,7 @@ test('unknown backend image requests do not mislabel preprocessing failures as i
   }
   let inferenceCalled = false
   const ollamaService = {
+    getModelInfo: async () => ({ hasThinking: false, modelfileSamplers: {} }),
     getModelCapabilities: async () => ({ thinking: false, vision: 'unknown' as const }),
     chatStream: async () => {
       inferenceCalled = true
@@ -303,6 +306,7 @@ test('text-only JSON chat preserves long histories through the controller bounda
   }
   let upstreamMessages: unknown[] = []
   const ollamaService = {
+    getModelInfo: async () => ({ hasThinking: false, modelfileSamplers: {} }),
     getModelCapabilities: async () => ({ thinking: false, vision: 'unsupported' as const }),
     chat: async (chatRequest: { messages: unknown[] }) => {
       upstreamMessages = chatRequest.messages
@@ -340,8 +344,8 @@ test('text-only JSON chat preserves long histories through the controller bounda
 
   assert.ok(result)
   assert.equal(result.message.content, 'Text response')
-  assert.equal(upstreamMessages.length, 202)
-  assert.deepEqual(upstreamMessages.slice(1), messages)
+  // The pipeline stub passes these messages through. The controller must forward every turn.
+  assert.deepEqual(upstreamMessages, messages)
   assert.ok(
     upstreamMessages.every(
       (message) => typeof (message as { content?: unknown }).content === 'string'

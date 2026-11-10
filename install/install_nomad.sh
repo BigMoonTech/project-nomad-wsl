@@ -218,7 +218,14 @@ ensure_docker_installed() {
     echo "Enable Docker Desktop's WSL integration and select its engine in this distribution." >&2
     return 1
   fi
-  echo "Connected to $engine ($(docker info --format '{{.Architecture}}'))."
+  local daemon_arch
+  daemon_arch=$(docker info --format '{{.Architecture}}')
+  case "$daemon_arch" in
+    x86_64|amd64) export DOCKER_DEFAULT_PLATFORM=linux/amd64 ;;
+    aarch64|arm64) export DOCKER_DEFAULT_PLATFORM=linux/arm64 ;;
+    *) echo "Unsupported Docker Engine architecture: $daemon_arch" >&2; return 1 ;;
+  esac
+  echo "Connected to $engine. Installing $DOCKER_DEFAULT_PLATFORM images."
 }
 
 check_docker_compose() {
@@ -227,6 +234,7 @@ check_docker_compose() {
     echo "Enable or update Docker Desktop's Compose plugin for this WSL distribution." >&2
     return 1
   fi
+  sudo apt-get update || return 1
   local package
   for package in docker-compose-plugin docker-compose-v2; do
     if apt-cache show "$package" >/dev/null 2>&1 && sudo apt-get install -y "$package" && docker compose version >/dev/null; then
@@ -692,7 +700,8 @@ main() {
   check_has_sudo
   check_is_debug_mode
   banner
-  exec 9>/run/lock/project-nomad-install.lock
+  sudo mkdir -p /run/project-nomad-installer
+  exec 9</run/project-nomad-installer
   flock -n 9 || { echo "Another NOMAD installation is in progress." >&2; return 1; }
   get_install_confirmation
   accept_terms
