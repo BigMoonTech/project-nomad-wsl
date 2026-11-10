@@ -4,6 +4,7 @@ import {
   FileEntry,
 } from '../../types/files.js'
 import { doResumableDownloadWithRetry } from '../utils/downloads.js'
+import { regionalMapPointerAfterError } from '../utils/regional_map_lfs.js'
 import { extract } from 'tar'
 import env from '#start/env'
 import {
@@ -328,7 +329,13 @@ export class MapService implements IMapService {
 
       // Perform a HEAD request to get the content length
       const { default: axios } = await import('axios')
-      const response = await axios.head(url)
+      let response
+      try {
+        response = await axios.head(url, { timeout: 30000 })
+      } catch (error) {
+        const pointer = await regionalMapPointerAfterError(url, error)
+        return { filename, size: pointer.size }
+      }
 
       if (response.status !== 200) {
         throw new Error(`Failed to fetch file info: ${response.status} ${response.statusText}`)

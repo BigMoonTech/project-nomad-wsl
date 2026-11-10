@@ -322,9 +322,14 @@ export class DownloadService {
     // Delete the partial file from disk
     if (filepath) {
       try {
-        await deleteFileIfExists(filepath)
-        // Also try .tmp in case PR #448 staging is merged
         await deleteFileIfExists(filepath + '.tmp')
+        if (job.data.filetype === 'map') {
+          // A previous, complete map can still be in use while its replacement downloads.
+          await deleteFileIfExists(filepath + '.lfs.tmp')
+          await deleteFileIfExists(filepath + '.lfs')
+        } else {
+          await deleteFileIfExists(filepath)
+        }
       } catch {
         // File may not exist yet (waiting job)
       }

@@ -21,6 +21,7 @@ jobs:
           docker build --build-arg VERSION=ci -t nomad-admin:ci .
           docker run --rm --entrypoint node nomad-admin:ci -e \
             "require('@openzim/libzim'); require('sharp'); require('node:assert/strict').equal(require('./version.json').version, 'ci')"
+          docker run --rm --network none --entrypoint node nomad-admin:ci --test tests/unit/regional_map_lfs.spec.js
           docker run --rm --entrypoint pmtiles nomad-admin:ci version
           docker build -t nomad-updater:ci install/sidecar-updater
           docker run --rm --entrypoint docker nomad-updater:ci compose version

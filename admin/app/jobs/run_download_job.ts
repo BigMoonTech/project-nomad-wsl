@@ -2,6 +2,7 @@ import { Job, UnrecoverableError } from 'bullmq'
 import { RunDownloadJobParams, DownloadProgressData } from '../../types/downloads.js'
 import { QueueService } from '#services/queue_service'
 import { doResumableDownload, GatedContentAuthError } from '../utils/downloads.js'
+import { downloadRegionalMap } from '../utils/regional_map_lfs.js'
 import { createHash } from 'crypto'
 import { DockerService } from '#services/docker_service'
 import { ZimService } from '#services/zim_service'
@@ -104,7 +105,8 @@ export class RunDownloadJob {
     }, 2000)
 
     try {
-      await doResumableDownload({
+      const download = filetype === 'map' ? downloadRegionalMap : doResumableDownload
+      await download({
         url,
         filepath,
         timeout,
