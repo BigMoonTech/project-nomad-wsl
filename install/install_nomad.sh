@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Project N.O.M.A.D. Installation Script
+# Project NOMAD Installation Script
 
 ###################################################################################################################################################################################################
 
@@ -29,7 +29,7 @@ GREEN='\033[1;32m' # Light Green.
 #                                                                                                                                                                                                 #
 ###################################################################################################################################################################################################
 
-WHIPTAIL_TITLE="Project N.O.M.A.D Installation"
+WHIPTAIL_TITLE="Project NOMAD Installation"
 NOMAD_DIR="/opt/project-nomad"
 IS_WSL=false
 if grep -qi microsoft /proc/version 2>/dev/null; then
@@ -57,6 +57,22 @@ header() {
 header_red() {
   if [[ "${script_option_debug}" != 'true' ]]; then clear; clear; fi
   echo -e "${RED}#########################################################################${RESET}\\n"
+}
+
+banner() {
+  echo ""
+  echo -e "${GREEN}"
+  cat <<'NOMAD_ART'
+                             P R O J E C T
+                    _   _  ___  __  __    _    ____
+                   | \ | |/ _ \|  \/  |  / \  |  _ \
+                   |  \| | | | | |\/| | / _ \ | | | |
+                   | |\  | |_| | |  | |/ ___ \| |_| |
+                   |_| \_|\___/|_|  |_/_/   \_\____/
+NOMAD_ART
+  echo -e "${RESET}"
+  echo -e "${WHITE_R}                 Offline knowledge and education server${RESET}\n"
+  echo -e "${GREEN}#########################################################################${RESET}\n"
 }
 
 check_has_sudo() {
@@ -91,19 +107,13 @@ check_is_debian_based() {
     echo -e "${GREEN}#${RESET} This script is running on a Debian-based system.\\n"
 }
 
-check_is_x86_64() {
+check_architecture() {
   local arch
   arch="$(uname -m)"
-  if [[ "${arch}" != "x86_64" && "${arch}" != "amd64" ]]; then
-    echo -e "${YELLOW}#${RESET} WARNING: Detected architecture '${arch}'. NOMAD officially supports x86_64 only.\\n"
-    echo -e "${YELLOW}#${RESET} ARM64/aarch64 support is tracked in PR #419 and is not yet ready.\\n"
-    echo -e "${YELLOW}#${RESET} Continuing on an unsupported architecture will likely fail and may leave\\n"
-    echo -e "${YELLOW}#${RESET} partial Docker images and files behind that you'll need to clean up manually.\\n"
-    echo -e "${YELLOW}#${RESET} Continuing in 10 seconds... press Ctrl+C now to abort.\\n"
-    sleep 10
-    return
-  fi
-  echo -e "${GREEN}#${RESET} Architecture check passed (${arch}).\\n"
+  case "$arch" in
+    x86_64|amd64|aarch64|arm64) echo -e "${GREEN}#${RESET} Architecture check passed (${arch})." ;;
+    *) echo -e "${RED}#${RESET} Unsupported architecture '${arch}'. NOMAD requires x86-64 or ARM64 Linux." >&2; exit 1 ;;
+  esac
 }
 
 ensure_dependencies_installed() {
@@ -297,7 +307,7 @@ setup_nvidia_container_toolkit() {
   echo -e "${YELLOW}#${RESET} Installing NVIDIA container toolkit...\\n"
 
   # Install dependencies per https://docs.ollama.com/docker - wrapped in error handling
-  if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null; then
+  if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null; then
     echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit GPG key. Continuing anyway...\\n"
     return 0
   fi
@@ -430,8 +440,11 @@ setup_nvidia_wsl2() {
 }
 
 get_install_confirmation(){
-  echo -e "${YELLOW}#${RESET} This script will install Project N.O.M.A.D. and its dependencies on your machine."
-  echo -e "${YELLOW}#${RESET} If you already have Project N.O.M.A.D. installed with customized config or data, please be aware that running this installation script may overwrite existing files and configurations. It is highly recommended to back up any important data/configs before proceeding."
+  echo -e "${YELLOW}#${RESET} This script will install Project NOMAD and its dependencies on your machine."
+  if [[ -e "${NOMAD_DIR}/compose.yml" || -d "${NOMAD_DIR}/mysql" ]]; then
+    echo -e "${RED}#${RESET} Found an existing installation at ${NOMAD_DIR}. Use Settings → Check for Updates or the existing update script." >&2
+    exit 1
+  fi
   read -p "Are you sure you want to continue? (y/N): " choice
   case "$choice" in
     y|Y )
@@ -449,9 +462,9 @@ accept_terms() {
   echo "License Agreement & Terms of Use"
   echo "__________________________"
   printf "\n\n"
-  echo "Project N.O.M.A.D. is licensed under the Apache License 2.0. The full license can be found at https://www.apache.org/licenses/LICENSE-2.0 or in the LICENSE file of this repository."
+  echo "Project NOMAD is licensed under the Apache License 2.0. The full license can be found at https://www.apache.org/licenses/LICENSE-2.0 or in the LICENSE file of this repository."
   printf "\n"
-  echo "By accepting this agreement, you acknowledge that you have read and understood the terms and conditions of the Apache License 2.0 and agree to be bound by them while using Project N.O.M.A.D."
+  echo "By accepting this agreement, you acknowledge that you have read and understood the terms and conditions of the Apache License 2.0 and agree to be bound by them while using Project NOMAD"
   echo -e "\n\n"
   read -p "I have read and accept License Agreement & Terms of Use (y/N)? " choice
   case "$choice" in
@@ -468,7 +481,7 @@ accept_terms() {
 create_nomad_directory(){
   # Ensure the main installation directory exists
   if [[ ! -d "$NOMAD_DIR" ]]; then
-    echo -e "${YELLOW}#${RESET} Creating directory for Project N.O.M.A.D at $NOMAD_DIR...\\n"
+    echo -e "${YELLOW}#${RESET} Creating directory for Project NOMAD at $NOMAD_DIR...\\n"
     sudo mkdir -p "$NOMAD_DIR"
     sudo chown "$(whoami):$(whoami)" "$NOMAD_DIR"
 
@@ -498,15 +511,6 @@ download_management_compose_file() {
   local db_root_password=$(generateRandomPass)
   local db_user_password=$(generateRandomPass)
 
-  # If MySQL data directory exists from a previous install attempt, remove it.
-  # MySQL only initializes credentials on first startup when the data dir is empty.
-  # If stale data exists, MySQL ignores the new passwords above and uses the old ones,
-  # causing "Access denied" errors when the admin container tries to connect.
-  if [[ -d "${NOMAD_DIR}/mysql" ]]; then
-    echo -e "${YELLOW}#${RESET} Removing existing MySQL data directory to ensure credentials match...\\n"
-    sudo rm -rf "${NOMAD_DIR}/mysql"
-  fi
-
   # Inject dynamic env values into the compose file
   echo -e "${YELLOW}#${RESET} Configuring docker-compose file env variables...\\n"
   sed -i "s|URL=replaceme|URL=http://${local_ip_address}:8080|g" "$compose_file_path"
@@ -533,19 +537,19 @@ download_helper_scripts() {
   local update_script_path="${NOMAD_DIR}/update_nomad.sh"
 
   echo -e "${YELLOW}#${RESET} Downloading helper scripts...\\n"
-  if ! curl -fsSL "$START_SCRIPT_URL" -o "$start_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$START_SCRIPT_URL" -o "$start_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the start script. Please check the URL and try again."
     exit 1
   fi
   chmod +x "$start_script_path"
 
-  if ! curl -fsSL "$STOP_SCRIPT_URL" -o "$stop_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$STOP_SCRIPT_URL" -o "$stop_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the stop script. Please check the URL and try again."
     exit 1
   fi
   chmod +x "$stop_script_path"
 
-  if ! curl -fsSL "$UPDATE_SCRIPT_URL" -o "$update_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$UPDATE_SCRIPT_URL" -o "$update_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the update script. Please check the URL and try again."
     exit 1
   fi
@@ -636,7 +640,12 @@ verify_gpu_setup() {
         amd_gfx_version='gfx1034'
       elif echo "${amd_devices}" | grep -iq 'Rembrandt'; then
         amd_gfx_version='gfx1035'
-      elif echo "${amd_devices}" | grep -iEq 'Phoenix1?|Phoenix2'; then
+      elif echo "${amd_devices}" | grep -iEq 'Phoenix[0-9]?|Hawk ?Point ?[0-9]?|Radeon (780M|760M)'; then
+        # Phoenix (Ryzen 7040) / Hawk Point (Ryzen 8040) — 780M & 760M are both gfx1103.
+        # lspci device strings vary (Phoenix1/Phoenix2/Phoenix3, "Hawk Point", "HawkPoint1", or the bare
+        # "Radeon 780M Graphics" marketing name), so match all of them or the marker goes
+        # missing and the 780M silently drops to CPU. Kept before the Strix branches so a
+        # "Radeon 780M" string can't be miscaught. See gfx1103 regression.
         amd_gfx_version='gfx1103'
       elif echo "${amd_devices}" | grep -iEq 'Strix Halo'; then
         amd_gfx_version='gfx1151'
@@ -710,7 +719,7 @@ success_message() {
     echo -e "${GREEN}#${RESET} Project N.O.M.A.D's Command Center should automatically start whenever your device reboots. However, if you need to start it manually, you can always do so by running: ${WHITE_R}${NOMAD_DIR}/start_nomad.sh${RESET}\\n"
   fi
   echo -e "${GREEN}#${RESET} You can now access the management interface at http://localhost:8080 or http://${local_ip_address}:8080\\n"
-  echo -e "${GREEN}#${RESET} Thank you for supporting Project N.O.M.A.D!\\n"
+  echo -e "${GREEN}#${RESET} Thank you for supporting Project NOMAD!\\n"
 }
 
 ###################################################################################################################################################################################################
@@ -721,13 +730,14 @@ success_message() {
 
 # Pre-flight checks
 check_is_debian_based
-check_is_x86_64
+check_architecture
 check_is_bash
 check_has_sudo
 ensure_dependencies_installed
 check_is_debug_mode
 
 # Main install
+banner
 get_install_confirmation
 accept_terms
 ensure_docker_installed

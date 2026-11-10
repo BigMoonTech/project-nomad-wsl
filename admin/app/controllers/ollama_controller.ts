@@ -1,6 +1,8 @@
 import { ChatService } from '#services/chat_service'
 import { DockerService } from '#services/docker_service'
-import { OllamaService } from '#services/ollama_service'
+import { OllamaService, type NomadChatUsage } from '#services/ollama_service'
+import { TokenCalibrationService } from '#services/token_calibration_service'
+import { RagPipelineService } from '#services/rag_pipeline_service'
 import { RagService } from '#services/rag_service'
 import Service from '#models/service'
 import KVStore from '#models/kv_store'
@@ -9,10 +11,23 @@ import { chatSchema, getAvailableModelsSchema, unloadChatModelsSchema } from '#v
 import { assertNotCloudMetadataUrl } from '#validators/common'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
-import { RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
+import { DEFAULT_KEEP_ALIVE } from '../../constants/ollama.js'
+import { resolveResponseStyle } from '../utils/response_style.js'
+import { resolveSamplerProfile } from '../utils/sampler.js'
+import type { PipelineTrace } from '../../types/rag.js'
+import { buildCitations } from '../utils/rag_prompt.js'
 import logger from '@adonisjs/core/services/logger'
-type Message = { role: 'system' | 'user' | 'assistant'; content: string }
+import { rm } from 'node:fs/promises'
+import {
+  attachImagesToLatestUserMessage,
+  ChatImageError,
+  normalizeChatImages,
+  type NormalizedChatImage,
+} from '../utils/chat_images.js'
+
+const unknownVisionCompatibilityMessage = (model: string) =>
+  `NOMAD cannot confirm that "${model}" accepts images, and this image request failed. Choose a model marked "Supports images", or remove the image and try again.`
 
 @inject()
 export default class OllamaController {
@@ -20,7 +35,9 @@ export default class OllamaController {
     private chatService: ChatService,
     private dockerService: DockerService,
     private ollamaService: OllamaService,
-    private ragService: RagService
+    private ragPipelineService: RagPipelineService,
+    private ragService: RagService,
+    private tokenCalibration: TokenCalibrationService
   ) { }
 
   async availableModels({ request }: HttpContext) {
@@ -48,7 +65,78 @@ export default class OllamaController {
   }
 
   async chat({ request, response }: HttpContext) {
-    const reqData = await request.validateUsing(chatSchema)
+    const uploadedImages = request.files('images', {
+      size: '8mb',
+      extnames: ['jpg', 'jpeg', 'png', 'webp'],
+    })
+    const cleanupUploadedImages = () =>
+      Promise.all(
+        uploadedImages
+          .filter((file) => file.tmpPath)
+          .map((file) => rm(file.tmpPath!, { force: true }).catch(() => undefined))
+      )
+    let multipartPayload: unknown
+    if (uploadedImages.length > 0) {
+      const rawPayload = request.input('payload')
+      if (typeof rawPayload !== 'string') {
+        await cleanupUploadedImages()
+        return response.status(422).send({ message: 'Multipart chat requests require a JSON payload.' })
+      }
+      try {
+        multipartPayload = JSON.parse(rawPayload)
+      } catch {
+        await cleanupUploadedImages()
+        return response.status(422).send({ message: 'The multipart chat payload is not valid JSON.' })
+      }
+    }
+    // A multipart chat carries the collection inside the JSON payload rather than
+    // as a form field, so request.input() alone would silently drop it and every
+    // image request would search the whole knowledge base.
+    const rawCollection =
+      uploadedImages.length > 0 &&
+      multipartPayload &&
+      typeof multipartPayload === 'object' &&
+      'collection' in multipartPayload
+        ? (multipartPayload as { collection?: unknown }).collection
+        : request.input('collection', null)
+    const collectionFilter: string | null =
+      typeof rawCollection === 'string' && rawCollection ? rawCollection : null
+
+    let reqData: Awaited<ReturnType<typeof chatSchema.validate>>
+    try {
+      reqData =
+        uploadedImages.length > 0
+          ? await chatSchema.validate(multipartPayload)
+          : await request.validateUsing(chatSchema)
+    } catch (error) {
+      await cleanupUploadedImages()
+      throw error
+    }
+
+    let normalizedImages: NormalizedChatImage[]
+    try {
+      normalizedImages = await normalizeChatImages(uploadedImages)
+    } catch (error) {
+      if (error instanceof ChatImageError) {
+        return response.status(error.status).send({ message: error.message })
+      }
+      throw error
+    } finally {
+      await cleanupUploadedImages()
+    }
+
+    const modelCapabilities = await this.ollamaService.getModelCapabilities(reqData.model)
+    if (
+      normalizedImages.length > 0 &&
+      !reqData.messages.some((message) => message.role === 'user')
+    ) {
+      return response.status(422).send({ message: 'Images require a user message.' })
+    }
+    if (normalizedImages.length > 0 && modelCapabilities.vision === 'unsupported') {
+      return response.status(422).send({
+        message: `The selected model "${reqData.model}" does not support image input.`,
+      })
+    }
 
     // Flush SSE headers immediately so the client connection is open while
     // pre-processing (query rewriting, RAG lookup) runs in the background.
@@ -59,89 +147,64 @@ export default class OllamaController {
       response.response.flushHeaders()
     }
 
+    let unknownVisionUpstreamRejected = false
     try {
-      // If there are no system messages in the chat inject system prompts
-      const hasSystemMessage = reqData.messages.some((msg) => msg.role === 'system')
-      if (!hasSystemMessage) {
-        const systemPrompt = {
-          role: 'system' as const,
-          content: SYSTEM_PROMPTS.default,
-        }
-        logger.debug('[OllamaController] Injecting system prompt')
-        reqData.messages.unshift(systemPrompt)
-      }
+      // Everything from system-prompt assembly through query rewriting,
+      // retrieval, context trimming and the num_ctx decision lives in
+      // RagPipelineService so the eval harness exercises this exact code path.
+      // Knowledge base retrieval is user-toggleable (chat header + AI Assistant
+      // settings, both writing rag.enabled). Unset means on, preserving the
+      // behaviour from before the toggle existed.
+      const ragEnabled = (await KVStore.getValue('rag.enabled')) ?? true
+      const trace = await this.ragPipelineService.buildPrompt(reqData.messages, reqData.model, {
+        collection: collectionFilter ?? undefined,
+        skipRetrieval: !ragEnabled,
+      })
+      reqData.messages = trace.messages
+      const numCtx = trace.numCtx
+      const numPredict = trace.numPredict
+      // Provenance for the answer about to be generated (#1179). Built from
+      // trace.injected -- what the model actually read -- and surfaced under the
+      // answer as "Sources". Empty whenever retrieval was skipped or declined,
+      // which is the honest result: no context, no citations.
+      const sources = buildCitations(trace.injected)
+      // Keeping the model resident is what makes the KV cache worth building:
+      // Ollama's default evicts after 5 minutes, which is well inside the time a
+      // user spends reading an answer and typing the next question.
+      const keepAlive = (await KVStore.getValue('ai.keepAlive')) || DEFAULT_KEEP_ALIVE
 
-      // Query rewriting for better RAG retrieval with manageable context
-      // Will return user's latest message if no rewriting is needed
-      const rewrittenQuery = await this.rewriteQueryWithContext(reqData.messages, reqData.model)
-
-      logger.debug(`[OllamaController] Rewritten query for RAG: "${rewrittenQuery}"`)
-      if (rewrittenQuery) {
-        const relevantDocs = await this.ragService.searchSimilarDocuments(
-          rewrittenQuery,
-          5, // Top 5 most relevant chunks
-          0.3 // Minimum similarity score of 0.3
-        )
-
-        logger.debug(`[RAG] Retrieved ${relevantDocs.length} relevant documents for query: "${rewrittenQuery}"`)
-
-        // If relevant context is found, inject as a system message with adaptive limits
-        if (relevantDocs.length > 0) {
-          // Determine context budget based on model size
-          const { maxResults, maxTokens } = this.getContextLimitsForModel(reqData.model)
-          let trimmedDocs = relevantDocs.slice(0, maxResults)
-
-          // Apply token cap if set (estimate ~3.5 chars per token)
-          // Always include the first (most relevant) result — the cap only gates subsequent results
-          if (maxTokens > 0) {
-            const charCap = maxTokens * 3.5
-            let totalChars = 0
-            trimmedDocs = trimmedDocs.filter((doc, idx) => {
-              totalChars += doc.text.length
-              return idx === 0 || totalChars <= charCap
-            })
-          }
-
-          logger.debug(
-            `[RAG] Injecting ${trimmedDocs.length}/${relevantDocs.length} results (model: ${reqData.model}, maxResults: ${maxResults}, maxTokens: ${maxTokens || 'unlimited'})`
-          )
-
-          const contextText = trimmedDocs
-            .map((doc, idx) => `[Context ${idx + 1}] (Relevance: ${(doc.score * 100).toFixed(1)}%)\n${doc.text}`)
-            .join('\n\n')
-
-          const systemMessage = {
-            role: 'system' as const,
-            content: SYSTEM_PROMPTS.rag_context(contextText),
-          }
-
-          // Insert system message at the beginning (after any existing system messages)
-          const firstNonSystemIndex = reqData.messages.findIndex((msg) => msg.role !== 'system')
-          const insertIndex = firstNonSystemIndex === -1 ? 0 : firstNonSystemIndex
-          reqData.messages.splice(insertIndex, 0, systemMessage)
-        }
-      }
-
-      // If system messages are large (e.g. due to RAG context), request a context window big
-      // enough to fit them. Ollama respects num_ctx per-request; LM Studio ignores it gracefully.
-      const systemChars = reqData.messages
-        .filter((m) => m.role === 'system')
-        .reduce((sum, m) => sum + m.content.length, 0)
-      const estimatedSystemTokens = Math.ceil(systemChars / 3.5)
-      let numCtx: number | undefined
-      if (estimatedSystemTokens > 3000) {
-        const needed = estimatedSystemTokens + 2048 // leave room for conversation + response
-        numCtx = [8192, 16384, 32768, 65536].find((n) => n >= needed) ?? 65536
-        logger.debug(`[OllamaController] Large system prompt (~${estimatedSystemTokens} tokens), requesting num_ctx: ${numCtx}`)
-      }
-
-      // Check if the model supports "thinking" capability for enhanced response generation
+      // Check if the model supports "thinking" capability for enhanced response generation.
+      // Thinking is only enabled when the model supports it AND the user wants it: the explicit
+      // per-request preference wins, otherwise the global default (ai.autoThinking, default OFF).
       // If gpt-oss model, it requires a text param for "think" https://docs.ollama.com/api/chat
-      const thinkingCapability = await this.ollamaService.checkModelHasThinking(reqData.model)
-      const think: boolean | 'medium' = thinkingCapability ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true) : false
+      // One /api/show read, memoized per model, for two decisions: whether the
+      // model can think, and what sampler values its author baked in.
+      const modelInfo = await this.ollamaService.getModelInfo(reqData.model)
+      const thinkingCapability = modelInfo.hasThinking
+      let thinkingEnabled = false
+      if (thinkingCapability) {
+        thinkingEnabled = reqData.think ?? ((await KVStore.getValue('ai.autoThinking')) ?? false)
+      }
+      const think: boolean | 'medium' =
+        thinkingEnabled ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true) : false
 
-      // Separate sessionId from the Ollama request payload — Ollama rejects unknown fields
-      const { sessionId, ...ollamaRequest } = reqData
+      // Sampler settings for this turn. Chat used to send none of these and
+      // inherit the backend's defaults, which on a heavily quantized small model
+      // is the wandering, repetitive output people read as "the local model is
+      // bad". Resolved here rather than in OllamaService so the ancillary
+      // structured calls, which want temperature 0 and a grammar, stay untouched.
+      const sampler = resolveSamplerProfile(
+        await resolveResponseStyle(),
+        modelInfo.modelfileSamplers
+      )
+
+      // Separate sessionId and the resolved thinking preference from the Ollama request payload —
+      // Ollama rejects unknown fields, and `think` is re-derived above (not forwarded raw).
+      const { sessionId, think: _thinkPref, ...ollamaRequest } = reqData
+      const upstreamMessages = attachImagesToLatestUserMessage(
+        ollamaRequest.messages,
+        normalizedImages
+      )
 
       // Save user message to DB before streaming if sessionId provided
       let userContent: string | null = null
@@ -155,20 +218,62 @@ export default class OllamaController {
 
       if (reqData.stream) {
         logger.debug(`[OllamaController] Initiating streaming response for model: "${reqData.model}" with think: ${think}`)
-        // Headers already flushed above
-        const stream = await this.ollamaService.chatStream({ ...ollamaRequest, think, numCtx })
+        // Headers already flushed above.
+        // Abort the upstream generation if the client disconnects — otherwise an abandoned
+        // request keeps decoding server-side and, with Ollama's default OLLAMA_NUM_PARALLEL=1,
+        // blocks every later chat/RAG request until the model is manually stopped (#1065).
+        const abortController = new AbortController()
+        response.response.on('close', () => abortController.abort())
         let fullContent = ''
-        for await (const chunk of stream) {
-          if (chunk.message?.content) {
-            fullContent += chunk.message.content
+        let doneReason: string | undefined
+        let completionTokens: number | undefined
+        try {
+          const stream = await this.ollamaService.chatStream({
+            ...ollamaRequest,
+            messages: upstreamMessages,
+            think,
+            thinkingCapable: thinkingCapability,
+            numCtx,
+            numPredict,
+            keepAlive,
+          sampler,
+            signal: abortController.signal,
+          })
+          for await (const chunk of stream) {
+            if (chunk.message?.content) {
+              fullContent += chunk.message.content
+            }
+            if (chunk.usage) {
+              completionTokens = chunk.usage.completionTokens
+              this._recordUsage(reqData.model, trace, chunk.usage)
+            }
+            if (chunk.done_reason) doneReason = chunk.done_reason
+            response.response.write(`data: ${JSON.stringify(chunk)}\n\n`)
           }
-          response.response.write(`data: ${JSON.stringify(chunk)}\n\n`)
+        } catch (err) {
+          if (abortController.signal.aborted) {
+            logger.debug('[OllamaController] Client disconnected; aborted upstream Ollama generation')
+            return
+          }
+          unknownVisionUpstreamRejected =
+            normalizedImages.length > 0 && modelCapabilities.vision === 'unknown'
+          throw err
+        }
+        if (doneReason === 'length') {
+          this._logLengthStop(reqData.model, numCtx, numPredict, completionTokens)
+        }
+        // Trailing citation event, written before end(). It carries no `message`
+        // key, which is how the client tells it apart from Ollama's own chunks.
+        if (sources.length > 0) {
+          response.response.write(`data: ${JSON.stringify({ sources })}
+
+`)
         }
         response.response.end()
 
         // Save assistant message and optionally generate title
         if (sessionId && fullContent) {
-          await this.chatService.addMessage(sessionId, 'assistant', fullContent)
+          await this.chatService.addMessage(sessionId, 'assistant', fullContent, sources)
           const messageCount = await this.chatService.getMessageCount(sessionId)
           if (messageCount <= 2 && userContent) {
             this.chatService.generateTitle(sessionId, userContent, fullContent, reqData.model).catch((err) => {
@@ -180,10 +285,35 @@ export default class OllamaController {
       }
 
       // Non-streaming (legacy) path
-      const result = await this.ollamaService.chat({ ...ollamaRequest, think, numCtx })
+      let result
+      try {
+        result = await this.ollamaService.chat({
+          ...ollamaRequest,
+          messages: upstreamMessages,
+          think,
+          thinkingCapable: thinkingCapability,
+          numCtx,
+          numPredict,
+          keepAlive,
+        sampler,
+        })
+      } catch (err) {
+        // A backend that never advertised vision support rejecting a request that
+        // carried images is the signal that it cannot see them. Recorded here and
+        // translated into the compatibility message by the outer catch.
+        unknownVisionUpstreamRejected =
+          normalizedImages.length > 0 && modelCapabilities.vision === 'unknown'
+        throw err
+      }
+      if (result?.usage) {
+        this._recordUsage(reqData.model, trace, result.usage)
+      }
+      if (result?.done_reason === 'length') {
+        this._logLengthStop(reqData.model, numCtx, numPredict, result.usage?.completionTokens)
+      }
 
       if (sessionId && result?.message?.content) {
-        await this.chatService.addMessage(sessionId, 'assistant', result.message.content)
+        await this.chatService.addMessage(sessionId, 'assistant', result.message.content, sources)
         const messageCount = await this.chatService.getMessageCount(sessionId)
         if (messageCount <= 2 && userContent) {
           this.chatService.generateTitle(sessionId, userContent, result.message.content, reqData.model).catch((err) => {
@@ -192,14 +322,72 @@ export default class OllamaController {
         }
       }
 
-      return result
+      return { ...result, sources }
     } catch (error) {
       if (reqData.stream) {
-        response.response.write(`data: ${JSON.stringify({ error: true })}\n\n`)
+        const streamError =
+          unknownVisionUpstreamRejected
+            ? {
+                error: true,
+                message: unknownVisionCompatibilityMessage(reqData.model),
+              }
+            : { error: true }
+        response.response.write(`data: ${JSON.stringify(streamError)}\n\n`)
         response.response.end()
         return
       }
+      if (unknownVisionUpstreamRejected) {
+        return response.status(422).send({
+          message: unknownVisionCompatibilityMessage(reqData.model),
+        })
+      }
       throw error
+    }
+  }
+
+  /**
+   * A reply that hit the generation cap reaches the user cut off. The client
+   * shows that from done_reason; this puts it in the admin log with the numbers
+   * needed to tell a small window from a cap that is set too low (#1342).
+   */
+  private _logLengthStop(
+    model: string,
+    numCtx: number | undefined,
+    numPredict: number | undefined,
+    completionTokens: number | undefined
+  ): void {
+    logger.info(
+      `[OllamaController] ${model} stopped at the length limit: ` +
+        `${completionTokens ?? '?'} tokens generated, num_predict=${numPredict ?? 'unset'}, num_ctx=${numCtx ?? 'unset'}`
+    )
+  }
+
+  /**
+   * Close the loop on token accounting.
+   *
+   * The backend just told us exactly how many tokens the prompt really was.
+   * Comparing that against what we estimated is what lets the estimator correct
+   * itself per model — free ground truth that used to be discarded. Also logs
+   * the prefill rate, which is the practical prefix-cache-hit signal: a reused
+   * KV prefix means many prompt tokens for very little prefill time.
+   *
+   * Best-effort throughout; a calibration failure must never affect the reply.
+   */
+  private _recordUsage(model: string, trace: PipelineTrace, usage: NomadChatUsage): void {
+    if (trace.uncalibratedPromptTokens && usage.promptTokens) {
+      this.tokenCalibration
+        .record(model, trace.uncalibratedPromptTokens, usage.promptTokens)
+        .catch((err) => {
+          logger.debug(`[OllamaController] Token calibration failed: ${err?.message ?? err}`)
+        })
+
+      if (usage.promptEvalMs !== undefined && usage.promptEvalMs > 0) {
+        const tokensPerMs = usage.promptTokens / usage.promptEvalMs
+        logger.debug(
+          `[OllamaController] Prefill: ${usage.promptTokens} tokens in ${usage.promptEvalMs.toFixed(0)}ms ` +
+            `(${tokensPerMs.toFixed(1)} tok/ms; a high rate means the KV prefix was reused)`
+        )
+      }
     }
   }
 
@@ -359,91 +547,13 @@ export default class OllamaController {
     }
   }
 
-  async installedModels({ }: HttpContext) {
-    return await this.ollamaService.getModels()
+  async installedModels({}: HttpContext) {
+    const models = await this.ollamaService.getModels()
+    // Enrich from backend-reported capabilities; never guess from model names.
+    const capabilities = await Promise.all(
+      models.map((m) => this.ollamaService.getModelCapabilities(m.name, m))
+    )
+    return models.map((m, i) => ({ ...m, ...capabilities[i] }))
   }
 
-  /**
-   * Determines RAG context limits based on model size extracted from the model name.
-   * Parses size indicators like "1b", "3b", "8b", "70b" from model names/tags.
-   */
-  private getContextLimitsForModel(modelName: string): { maxResults: number; maxTokens: number } {
-    // Extract parameter count from model name (e.g., "llama3.2:3b", "qwen2.5:1.5b", "gemma:7b")
-    const sizeMatch = modelName.match(/(\d+\.?\d*)[bB]/)
-    const paramBillions = sizeMatch ? parseFloat(sizeMatch[1]) : 8 // default to 8B if unknown
-
-    for (const tier of RAG_CONTEXT_LIMITS) {
-      if (paramBillions <= tier.maxParams) {
-        return { maxResults: tier.maxResults, maxTokens: tier.maxTokens }
-      }
-    }
-
-    // Fallback: no limits
-    return { maxResults: 5, maxTokens: 0 }
-  }
-
-  private async rewriteQueryWithContext(
-    messages: Message[],
-    model: string
-  ): Promise<string | null> {
-    const lastUserMessage = [...messages].reverse().find(msg => msg.role === 'user')
-
-    try {
-      // Skip the entire RAG pipeline if there are no documents to search
-      const hasDocuments = await this.ragService.hasDocuments()
-      if (!hasDocuments) {
-        return null
-      }
-
-      // Get recent conversation history (last 6 messages for 3 turns)
-      const recentMessages = messages.slice(-6)
-
-      // Skip rewriting on the very first turn — with only one user message
-      // there is no prior context to fold in, so the rewrite would just echo
-      // the message back at the cost of an extra LLM round-trip. From the
-      // first follow-up onward we need the rewrite so the RAG query carries
-      // entities and topics from earlier turns ("the bars" → "Hershey's bars
-      // chocolate poisoning dog"); without it, embeddings match nothing and
-      // the assistant loses the thread.
-      const userMessages = recentMessages.filter(msg => msg.role === 'user')
-      if (userMessages.length < 2) {
-        return lastUserMessage?.content || null
-      }
-
-      const conversationContext = recentMessages
-        .map(msg => {
-          const role = msg.role === 'user' ? 'User' : 'Assistant'
-          // Truncate assistant messages to first 200 chars to keep context manageable
-          const content = msg.role === 'assistant'
-            ? msg.content.slice(0, 200) + (msg.content.length > 200 ? '...' : '')
-            : msg.content
-          return `${role}: "${content}"`
-        })
-        .join('\n')
-
-      const response = await this.ollamaService.chat({
-        model,
-        messages: [
-          {
-            role: 'system',
-            content: SYSTEM_PROMPTS.query_rewrite,
-          },
-          {
-            role: 'user',
-            content: `Conversation:\n${conversationContext}\n\nRewritten Query:`,
-          },
-        ],
-      })
-
-      const rewrittenQuery = response.message.content.trim()
-      logger.info(`[RAG] Query rewritten: "${rewrittenQuery}"`)
-      return rewrittenQuery
-    } catch (error) {
-      logger.error(
-        `[RAG] Query rewriting failed: ${error instanceof Error ? error.message : error}`
-      )
-      // Fallback to last user message if rewriting fails
-      return lastUserMessage?.content || null
-    }
-  }
 }

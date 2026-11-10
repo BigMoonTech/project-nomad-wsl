@@ -2,17 +2,26 @@
 
 ## General Questions
 
-### What is N.O.M.A.D.?
-N.O.M.A.D. (Node for Offline Media, Archives, and Data) is a personal server that gives you access to knowledge, education, and AI assistance without requiring an internet connection. It runs on your own hardware, keeping your data private and accessible anytime.
+### What is NOMAD?
+NOMAD is a personal server that gives you access to knowledge, education, and AI assistance without requiring an internet connection. It runs on your own hardware, keeping your data private and accessible anytime.
 
-### Do I need internet to use N.O.M.A.D.?
+### Do I need internet to use NOMAD?
 No — that's the whole point. Once your content is downloaded, everything works offline. You only need internet to:
 - Download new content
 - Update the software
 - Sync the latest versions of Wikipedia, maps, etc.
 
+### What operating system does NOMAD need?
+Debian-based Linux. **Ubuntu 26.04 LTS is what we recommend and test on** for new installs.
+
+Ubuntu 24.04 LTS and Debian 12 are also supported, so there is no need to reinstall if you are already on one of those. Windows users can follow the [WSL2 guide](https://www.projectnomad.us/install/wsl2), which is community-supported.
+
+macOS and non-Debian distributions like Fedora or Arch are not officially supported. NOMAD does not need a desktop environment, so Ubuntu Server is a fine choice if you are comfortable at the terminal.
+
+For a full walkthrough including the Ubuntu install itself, see the [Installation Guide](https://www.projectnomad.us/install).
+
 ### What hardware do I need?
-N.O.M.A.D. is designed for capable hardware, especially if you want to use the AI features. Recommended:
+NOMAD is designed for capable hardware, especially if you want to use the AI features. Recommended:
 - Modern multi-core CPU (AMD Ryzen 7 with Radeon graphics is the community sweet spot)
 - 16GB+ RAM (32GB+ for best AI performance)
 - SSD storage (size depends on content — 500GB minimum, 1TB+ recommended)
@@ -20,8 +29,32 @@ N.O.M.A.D. is designed for capable hardware, especially if you want to use the A
 
 **For detailed build recommendations at three price points ($150–$1,000+), see the [Hardware Guide](https://www.projectnomad.us/hardware).**
 
+### How much RAM do I need?
+
+**Without the AI Assistant, the whole stack sits under 1GB.** Measured on a running
+install: the Command Center 241MB, MySQL 444MB, Redis 9MB, Kiwix 101MB, and the
+knowledge base index 155MB. That is why 4GB is a real minimum rather than a
+defensive one.
+
+**The AI is the variable, and it is the model rather than NOMAD.** Ollama idles at
+roughly 1.2GB, and a model needs about its download size resident while it answers,
+so an 8B model at ~4.6GB wants about that much on top. **8GB is workable for a small
+model, 16GB is comfortable, and 32GB is the recommendation if you want to run larger
+ones.**
+
+Where that memory comes from depends on your hardware. With a discrete GPU the model
+loads into VRAM and never touches system RAM, so VRAM is the number that limits which
+models you can run. With an integrated GPU or no GPU at all, it comes out of system
+RAM, which is why a CPU-only box needs more of it.
+
 ### How much storage do I need?
-It depends on what you download:
+
+**To install NOMAD itself: about 5GB, so leave 10GB free.** That covers the
+Command Center and its database, before any content. Adding the AI Assistant
+brings the total to roughly 25GB, because Ollama and a general-purpose model are
+both large.
+
+After that it depends entirely on what you download:
 - Full Wikipedia: ~95GB
 - Khan Academy courses: ~50GB
 - Medical references: ~500MB
@@ -54,7 +87,7 @@ Content is as current as when it was last downloaded. Wikipedia snapshots are ty
 ### Can I add my own files?
 Yes — with the Knowledge Base. Upload PDFs, text files, and other documents to the [Knowledge Base](/knowledge-base), and the AI can reference them when answering your questions. This uses semantic search to find relevant information from your uploaded files.
 
-For Kiwix content, N.O.M.A.D. uses standard ZIM files. For educational content, Kolibri uses its own channel format.
+For Kiwix content, NOMAD uses standard ZIM files. For educational content, Kolibri uses its own channel format.
 
 ### What are curated collection tiers?
 When selecting content in the Easy Setup wizard or Content Explorer, collections are organized into three tiers:
@@ -73,7 +106,7 @@ This helps you balance content coverage against storage usage.
 2. Type your question or request
 3. The AI responds in conversational style
 
-The AI must be installed first — enable it during Easy Setup or install it from the [Apps](/settings/apps) page.
+The AI must be installed first — enable it during Easy Setup or install it from the [Supply Depot](/supply-depot) page.
 
 ### How do I upload documents to the Knowledge Base?
 1. Go to **[Knowledge Base →](/knowledge-base)**
@@ -104,7 +137,7 @@ The Early Access Channel lets you opt in to receive release candidate builds wit
 2. Refresh the page (Ctrl+R or Cmd+R)
 3. Go back to the Command Center and try again
 4. Check Settings → System to see if the service is running
-5. Try restarting the service (Stop, then Start in Apps manager)
+5. Try restarting the service (Stop, then Start in the Supply Depot)
 
 ### Maps show a gray/blank area
 
@@ -119,7 +152,7 @@ The Maps feature requires downloaded map data. If you see a blank area:
 This usually means the Information Library service started before its Kiwix library index was fully initialized.
 
 Try this recovery flow:
-1. Go to **[Apps](/settings/apps)**
+1. Go to **[Supply Depot](/supply-depot)**
 2. Stop **Information Library (Kiwix)**
 3. Wait 10-15 seconds, then start it again
 4. If the error persists, run **Force Reinstall** for Information Library from the same page
@@ -136,34 +169,34 @@ Local AI requires significant computing power. To improve speed:
 
 ### How do I enable GPU acceleration for AI?
 
-N.O.M.A.D. automatically detects NVIDIA GPUs when the NVIDIA Container Toolkit is installed on the host system. To set up GPU acceleration:
+NOMAD automatically detects NVIDIA GPUs when the NVIDIA Container Toolkit is installed on the host system. To set up GPU acceleration:
 
 1. **Install an NVIDIA GPU** in your server (if not already present)
 2. **Install the NVIDIA Container Toolkit** on the host — follow the [official installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-3. **Reinstall the AI Assistant** — Go to [Apps](/settings/apps), find AI Assistant, and click **Force Reinstall**
+3. **Reinstall the AI Assistant** — Go to [Supply Depot](/supply-depot), find AI Assistant, and click **Force Reinstall**
 
-N.O.M.A.D. will detect the GPU during installation and configure the AI to use it automatically. You'll see "NVIDIA container runtime detected" in the installation progress.
+NOMAD will detect the GPU during installation and configure the AI to use it automatically. You'll see "NVIDIA container runtime detected" in the installation progress.
 
 **Tip:** Run a [System Benchmark](/settings/benchmark) before and after to see the difference. GPU-accelerated systems typically see 100+ tokens per second vs 10-15 on CPU only.
 
 ### I added/changed my GPU but AI is still slow
 
-When you add or swap a GPU, N.O.M.A.D. needs to reconfigure the AI container to use it:
+When you add or swap a GPU, NOMAD needs to reconfigure the AI container to use it:
 
 1. Make sure the **NVIDIA Container Toolkit** is installed on the host
-2. Go to **[Apps](/settings/apps)**
+2. Go to **[Supply Depot](/supply-depot)**
 3. Find the **AI Assistant** and click **Force Reinstall**
 
 Force Reinstall recreates the AI container with GPU support enabled. Without this step, the AI continues to run on CPU only.
 
 ### I see a "GPU passthrough not working" warning
 
-N.O.M.A.D. checks whether your GPU is actually accessible inside the AI container. If a GPU is detected on the host but isn't working inside the container, you'll see a warning banner on the System Information and AI Settings pages. Click the **"Fix: Reinstall AI Assistant"** button to recreate the container with proper GPU access. This preserves your downloaded AI models.
+NOMAD checks whether your GPU is actually accessible inside the AI container. If a GPU is detected on the host but isn't working inside the container, you'll see a warning banner on the System Information and AI Settings pages. Click the **"Fix: Reinstall AI Assistant"** button to recreate the container with proper GPU access. This preserves your downloaded AI models.
 
 ### AI Chat not available
 
 The AI Chat page requires the AI Assistant to be installed first:
-1. Go to **[Apps](/settings/apps)**
+1. Go to **[Supply Depot](/supply-depot)**
 2. Install the **AI Assistant**
 3. Wait for the installation to complete
 4. The AI Chat will then be accessible from the home screen or [Chat](/chat)
@@ -171,7 +204,7 @@ The AI Chat page requires the AI Assistant to be installed first:
 ### Knowledge Base upload stuck
 
 If a document upload appears stuck in the Knowledge Base:
-1. Check that the AI Assistant is running in **Settings → Apps**
+1. Check that the AI Assistant is running in **Settings → Supply Depot**
 2. Large documents take time to process — wait a few minutes
 3. Try uploading a smaller document to verify the system is working
 4. Check **Settings → System** for any error messages
@@ -190,7 +223,7 @@ If submission fails, check the error message for details.
 The service might still be starting up. Wait 1-2 minutes and try again.
 
 If the problem persists:
-1. Go to **Settings → Apps**
+1. Go to **Settings → Supply Depot**
 2. Find the problematic service
 3. Click **Restart**
 4. Wait 30 seconds, then try again
@@ -220,7 +253,7 @@ Kolibri passwords are managed separately:
 
 ## Updates and Maintenance
 
-### How do I update N.O.M.A.D.?
+### How do I update NOMAD?
 1. Go to **Settings → Check for Updates**
 2. If an update is available, click to install
 3. The system will download updates and restart automatically
@@ -233,11 +266,16 @@ Yes, while you have internet access. Updates include:
 - Security improvements
 - Performance enhancements
 
+### Can NOMAD update itself automatically?
+Yes. NOMAD can keep its software, its installed apps, and its content current on its own. Automatic updates are **opt-in and off by default** — you turn on what you want from **Settings → Updates** (and, for apps, a per-app toggle in the Supply Depot). They only run inside a time window you choose, after safety checks, and never apply major version jumps automatically. See the **[Updates guide](/docs/updates)** for a full walkthrough.
+
 ### How do I update content (Wikipedia, etc.)?
 Content updates are separate from software updates:
 1. Go to **Settings → Content Manager** or **Content Explorer**
 2. Check for newer versions of your installed content
 3. Download updated versions as needed
+
+You can also turn on **automatic content updates** so installed Wikipedia/ZIM libraries and map regions refresh on their own overnight — see the [Updates guide](/docs/updates).
 
 Tip: New Wikipedia snapshots are released approximately monthly.
 
@@ -249,7 +287,7 @@ The system is designed to recover gracefully. If an update fails:
 
 ### Command-Line Maintenance
 
-For advanced troubleshooting or when you can't access the web interface, N.O.M.A.D. includes helper scripts in `/opt/project-nomad`:
+For advanced troubleshooting or when you can't access the web interface, NOMAD includes helper scripts in `/opt/project-nomad`:
 
 **Start all services:**
 ```bash
@@ -267,9 +305,9 @@ sudo bash /opt/project-nomad/update_nomad.sh
 ```
 *Note: This updates the Command Center only, not individual apps. Update apps through the web interface.*
 
-**Uninstall N.O.M.A.D.:**
+**Uninstall NOMAD:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/uninstall_nomad.sh -o uninstall_nomad.sh
+curl -fsSL https://raw.githubusercontent.com/BigMoonTech/project-nomad-wsl/refs/heads/main/install/uninstall_nomad.sh -o uninstall_nomad.sh
 sudo bash uninstall_nomad.sh
 ```
 *Warning: This cannot be undone. All data will be deleted.*
@@ -279,10 +317,10 @@ sudo bash uninstall_nomad.sh
 ## Privacy and Security
 
 ### Is my data private?
-Yes. N.O.M.A.D. runs entirely on your hardware. Your searches, AI conversations, and usage data never leave your server.
+Yes. NOMAD runs entirely on your hardware. Your searches, AI conversations, and usage data never leave your server.
 
 ### Can others access my server?
-By default, N.O.M.A.D. is accessible on your local network. Anyone on the same network can access it. For public networks, consider additional security measures.
+By default, NOMAD is accessible on your local network. Anyone on the same network can access it. For public networks, consider additional security measures.
 
 ### Does the AI send data anywhere?
 No. The AI runs completely locally. Your conversations are not sent to any external service. The AI chat is built into the Command Center — there's no separate service to configure.
@@ -300,8 +338,8 @@ You're in the docs now. Use the menu to find specific topics.
 ### Join the community
 Get help from other NOMAD users on **[Discord](https://discord.com/invite/crosstalksolutions)** for general N.O.M.A.D. questions.
 
-### Windows / WSL2-specific issues
-This is the **unofficial WSL2 fork** by BigMoonTech. For Windows / WSL2 / Docker Desktop-specific bugs, use the [fork's GitHub issues](https://github.com/BigMoonTech/project-nomad-wsl/issues). For everything else, the upstream Discord above is the right place.
+### Windows / WSL2 and native ARM64 issues
+This is the **unofficial WSL2 and ARM64 fork** by BigMoonTech. For Windows / WSL2 or native ARM64 bugs, use the [fork's GitHub issues](https://github.com/BigMoonTech/project-nomad-wsl/issues). For everything else, the upstream Discord above is the right place.
 
 ### Release Notes
 See what's changed in each version: **[Release Notes](/docs/release-notes)**

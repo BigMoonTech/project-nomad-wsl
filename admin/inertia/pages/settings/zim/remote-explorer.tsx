@@ -7,7 +7,6 @@ import {
 } from '@tanstack/react-query'
 import api from '~/lib/api'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useVirtualizer } from '@tanstack/react-virtual'
 import StyledTable from '~/components/StyledTable'
 import SettingsLayout from '~/layouts/SettingsLayout'
 import { Head } from '@inertiajs/react'
@@ -33,6 +32,7 @@ import {
 } from '@tabler/icons-react'
 import useDebounce from '~/hooks/useDebounce'
 import CategoryCard from '~/components/CategoryCard'
+import CreatorPacksSection from '~/components/CreatorPacksSection'
 import TierSelectionModal from '~/components/TierSelectionModal'
 import WikipediaSelector from '~/components/WikipediaSelector'
 import StyledSectionHeader from '~/components/StyledSectionHeader'
@@ -40,10 +40,13 @@ import type { CategoryWithStatus, SpecTier } from '../../../../types/collections
 import useDownloads from '~/hooks/useDownloads'
 import ActiveDownloads from '~/components/ActiveDownloads'
 import { SERVICE_NAMES } from '../../../../constants/service_names'
+import { ZimFileWithMetadata } from '../../../../types/zim'
 
 const CURATED_CATEGORIES_KEY = 'curated-categories'
 const WIKIPEDIA_STATE_KEY = 'wikipedia-state'
 const CUSTOM_LIBRARIES_KEY = 'custom-libraries'
+const CATALOG_LANGUAGES_KEY = 'catalog-languages'
+const ZIM_FILES_KEY = 'zim-files'
 
 type CustomLibrary = { id: number; name: string; base_url: string; is_default: boolean }
 type BrowseResult = {
@@ -80,6 +83,15 @@ export default function ZimRemoteExplorer() {
     } catch {}
     return 'default'
   })
+  // Catalog language filter - also persisted, since someone browsing in their own
+  // language wants that on every visit, not once per session.
+  const [language, setLanguage] = useState<string>(() => {
+    try {
+      return localStorage.getItem('nomad:zim-library-language') || 'eng'
+    } catch {
+      return 'eng'
+    }
+  })
   const [browseUrl, setBrowseUrl] = useState<string | null>(null)
   const [breadcrumbs, setBreadcrumbs] = useState<{ name: string; url: string }[]>([])
   const [manageModalOpen, setManageModalOpen] = useState(false)
@@ -101,6 +113,15 @@ export default function ZimRemoteExplorer() {
   const { data: wikipediaState, isLoading: isLoadingWikipedia } = useQuery({
     queryKey: [WIKIPEDIA_STATE_KEY],
     queryFn: () => api.getWikipediaState(),
+    refetchOnWindowFocus: false,
+  })
+
+  const { data: localFiles } = useQuery<ZimFileWithMetadata[]>({
+    queryKey: [ZIM_FILES_KEY],
+    queryFn: async () => {
+      const res = await api.listZimFiles()
+      return res.data.files
+    },
     refetchOnWindowFocus: false,
   })
 
@@ -129,15 +150,31 @@ export default function ZimRemoteExplorer() {
     retry: false,
   })
 
+  // The catalog's own language list, so the options are exactly what can be browsed and
+  // each carries a real book count. Returns [] when offline; the selector hides itself.
+  const { data: catalogLanguages } = useQuery({
+    queryKey: [CATALOG_LANGUAGES_KEY],
+    queryFn: () => api.listCatalogLanguages(),
+    refetchOnWindowFocus: false,
+    staleTime: 1000 * 60 * 60,
+  })
+
   const { data, fetchNextPage, isFetching, isLoading } =
     useInfiniteQuery<ListRemoteZimFilesResponse>({
-      queryKey: ['remote-zim-files', query],
+      // `language` is part of the key, so changing it resets pagination rather than
+      // appending a second language's pages onto the first one's.
+      queryKey: ['remote-zim-files', query, language],
       queryFn: async ({ pageParam = 0 }) => {
         // pageParam is an opaque Kiwix offset returned by the backend as `next_start`.
         // The backend accumulates across multiple upstream pages when needed (#731), so the
         // frontend can't derive the next offset from a 12-item page assumption.
         const start = typeof pageParam === 'number' ? pageParam : 0
-        const res = await api.listRemoteZimFiles({ start, count: 12, query: query || undefined })
+        const res = await api.listRemoteZimFiles({
+          start,
+          count: 12,
+          query: query || undefined,
+          language,
+        })
         if (!res) {
           throw new Error('Failed to fetch remote ZIM files.')
         }
@@ -152,16 +189,37 @@ export default function ZimRemoteExplorer() {
 
   const flatData = useMemo(() => {
     const mapped = data?.pages.flatMap((page) => page.items) || []
-    // remove items that are currently downloading
+    const localNames = new Set(localFiles?.map((f) => f.name) ?? [])
     return mapped.filter((item) => {
       const isDownloading = downloads?.some((download) => {
         const filename = item.download_url.split('/').pop()
         return filename && download.filepath.endsWith(filename)
       })
-      return !isDownloading
+      const isPresent = localNames.has(item.file_name)
+      return !isDownloading && !isPresent
     })
-  }, [data, downloads])
+  }, [data, downloads, localFiles])
   const hasMore = useMemo(() => data?.pages[data.pages.length - 1]?.has_more || false, [data])
+
+  // When a ZIM download drops off the polled downloads list it has completed (or been
+  // cancelled). The installed-files query (refetchOnWindowFocus is off) won't otherwise
+  // refresh, so a just-installed ZIM stays absent from `localFiles` and reappears in the
+  // accumulated remote pages as a ghost entry. Refresh it so the item is pruned.
+  const prevDownloadKeysRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const currentKeys = new Set((downloads ?? []).map((d) => d.jobId))
+    let anyRemoved = false
+    for (const key of prevDownloadKeysRef.current) {
+      if (!currentKeys.has(key)) {
+        anyRemoved = true
+        break
+      }
+    }
+    prevDownloadKeysRef.current = currentKeys
+    if (anyRemoved) {
+      queryClient.invalidateQueries({ queryKey: [ZIM_FILES_KEY] })
+    }
+  }, [downloads, queryClient])
 
   const fetchOnBottomReached = useCallback(
     (parentRef?: HTMLDivElement | null) => {
@@ -178,13 +236,6 @@ export default function ZimRemoteExplorer() {
     },
     [fetchNextPage, isFetching, hasMore]
   )
-
-  const virtualizer = useVirtualizer({
-    count: flatData.length,
-    estimateSize: () => 48, // Estimate row height
-    getScrollElement: () => tableParentRef.current,
-    overscan: 5, // Number of items to render outside the visible area
-  })
 
   //a check on mount and after a fetch to see if the table is already scrolled to the bottom and immediately needs to fetch more data
   useEffect(() => {
@@ -207,6 +258,15 @@ export default function ZimRemoteExplorer() {
   }, [customLibraries, selectedSource])
 
   // When selecting a custom library, navigate to its root
+  const handleLanguageChange = (value: string) => {
+    // localStorage can throw (private mode, blocked site data) -- the filter itself must
+    // still work, it just won't be remembered next visit.
+    try {
+      localStorage.setItem('nomad:zim-library-language', value)
+    } catch {}
+    setLanguage(value)
+  }
+
   const handleSourceChange = (value: string) => {
     localStorage.setItem('nomad:zim-library-source', value)
     if (value === 'default') {
@@ -435,7 +495,7 @@ export default function ZimRemoteExplorer() {
 
   return (
     <SettingsLayout>
-      <Head title="Content Explorer | Project N.O.M.A.D." />
+      <Head title="Content Explorer | Project NOMAD" />
       <div className="xl:pl-72 w-full">
         <main className="px-12 py-6">
           <div className="flex justify-between items-center">
@@ -493,6 +553,9 @@ export default function ZimRemoteExplorer() {
               />
             </div>
           ) : null}
+
+          {/* Creator Packs (hidden entirely when this build isn't configured) */}
+          <CreatorPacksSection />
 
           {/* Tiered Category Collections */}
           <div className="flex items-center gap-3 mt-8 mb-4">
@@ -564,7 +627,7 @@ export default function ZimRemoteExplorer() {
           {/* Default Kiwix library browser */}
           {selectedSource === 'default' && (
             <>
-              <div className="flex justify-start mt-4">
+              <div className="flex flex-wrap items-center justify-start gap-3 mt-4">
                 <Input
                   name="search"
                   label=""
@@ -577,16 +640,34 @@ export default function ZimRemoteExplorer() {
                   className="w-1/3"
                   leftIcon={<IconSearch className="w-5 h-5 text-text-muted" />}
                 />
+                {/* Hidden entirely when the catalog list is unavailable (offline), rather
+                    than shown as an empty dropdown the user cannot act on. */}
+                {catalogLanguages && catalogLanguages.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <label
+                      htmlFor="zim-language"
+                      className="text-sm font-medium text-text-secondary"
+                    >
+                      Language:
+                    </label>
+                    <select
+                      id="zim-language"
+                      value={language}
+                      onChange={(e) => handleLanguageChange(e.target.value)}
+                      className="rounded-md border border-border-default bg-surface-primary text-text-primary px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-desert-green"
+                    >
+                      <option value="all">All languages</option>
+                      {catalogLanguages.map((lang) => (
+                        <option key={lang.code} value={lang.code}>
+                          {lang.label} ({lang.book_count})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </div>
               <StyledTable<RemoteZimFileEntry & { actions?: any }>
-                data={flatData.map((i, idx) => {
-                  const row = virtualizer.getVirtualItems().find((v) => v.index === idx)
-                  return {
-                    ...i,
-                    height: `${row?.size || 48}px`,
-                    translateY: row?.start || 0,
-                  }
-                })}
+                data={flatData}
                 ref={tableParentRef}
                 loading={isLoading}
                 columns={[
@@ -598,6 +679,13 @@ export default function ZimRemoteExplorer() {
                   },
                   {
                     accessor: 'summary',
+                    render(record) {
+                      return (
+                        <span className="block max-w-md truncate text-text-muted" title={record.summary}>
+                          {record.summary}
+                        </span>
+                      )
+                    },
                   },
                   {
                     accessor: 'updated',
@@ -632,11 +720,97 @@ export default function ZimRemoteExplorer() {
                     },
                   },
                 ]}
-                className="relative overflow-x-auto overflow-y-auto h-[600px] w-full mt-4"
-                tableBodyStyle={{
-                  position: 'relative',
-                  height: `${virtualizer.getTotalSize()}px`,
+                expandable={{
+                  expandedRowRender(record) {
+                    const issuedDate = record.issued ? new Date(record.issued) : null
+                    const hasValidIssuedDate = issuedDate && !Number.isNaN(issuedDate.getTime())
+                    return (
+                      <div className="py-4 px-6">
+                        <p className="text-sm text-text-primary mb-4">{record.summary}</p>
+                        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 text-sm">
+                          {record.author && (
+                            <div>
+                              <span className="text-text-muted">Author: </span>
+                              <span className="text-text-primary">{record.author}</span>
+                            </div>
+                          )}
+                          {record.publisher && (
+                            <div>
+                              <span className="text-text-muted">Publisher: </span>
+                              <span className="text-text-primary">{record.publisher}</span>
+                            </div>
+                          )}
+                          {record.language && (
+                            <div>
+                              <span className="text-text-muted">Language: </span>
+                              <span className="text-text-primary">{record.language}</span>
+                            </div>
+                          )}
+                          {record.category && (
+                            <div>
+                              <span className="text-text-muted">Category: </span>
+                              <span className="text-text-primary">{record.category}</span>
+                            </div>
+                          )}
+                          {record.article_count != null && record.article_count > 0 && (
+                            <div>
+                              <span className="text-text-muted">Articles: </span>
+                              <span className="text-text-primary">
+                                {record.article_count.toLocaleString()}
+                              </span>
+                            </div>
+                          )}
+                          {record.media_count != null && record.media_count > 0 && (
+                            <div>
+                              <span className="text-text-muted">Media: </span>
+                              <span className="text-text-primary">
+                                {record.media_count.toLocaleString()}
+                              </span>
+                            </div>
+                          )}
+                          {hasValidIssuedDate && (
+                            <div>
+                              <span className="text-text-muted">Issued: </span>
+                              <span className="text-text-primary">
+                                {new Intl.DateTimeFormat('en-US', {
+                                  dateStyle: 'medium',
+                                }).format(issuedDate!)}
+                              </span>
+                            </div>
+                          )}
+                          {record.size_bytes > 0 && (
+                            <div>
+                              <span className="text-text-muted">Size: </span>
+                              <span className="text-text-primary">{formatBytes(record.size_bytes)}</span>
+                            </div>
+                          )}
+                        </div>
+                        {record.tags && (
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {record.tags
+                              .split(';')
+                              .filter(Boolean)
+                              .map((tag, i) => (
+                                <span
+                                  key={i}
+                                  className="inline-flex items-center rounded-full bg-surface-elevated px-2.5 py-0.5 text-xs font-medium text-text-muted"
+                                >
+                                  {tag.trim()}
+                                </span>
+                              ))}
+                          </div>
+                        )}
+                        {record.file_name && (
+                          <div className="mt-4">
+                            <span className="text-text-muted text-sm">File: </span>
+                            <code className="text-xs text-text-muted">{record.file_name}</code>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  },
                 }}
+                className="overflow-y-auto h-[600px] w-full mt-4"
                 containerProps={{
                   onScroll: (e) => fetchOnBottomReached(e.currentTarget as HTMLDivElement),
                 }}
@@ -748,7 +922,6 @@ export default function ZimRemoteExplorer() {
               )}
             </div>
           )}
-
           <ActiveDownloads filetype="zim" withHeader />
 
           {/* Manage Custom Libraries Modal */}

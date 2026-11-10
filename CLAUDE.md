@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Project N.O.M.A.D. (Node for Offline Media, Archives, and Data) is an offline-first knowledge and education server. It provides a "Command Center" web UI that orchestrates containerized tools (AI chat, offline Wikipedia, maps, education platform, etc.) via Docker. This fork targets Windows deployment using WSL2 and Docker Desktop.
+Project N.O.M.A.D. (Node for Offline Media, Archives, and Data) is an offline-first knowledge and education server. It provides a "Command Center" web UI that orchestrates containerized tools (AI chat, offline Wikipedia, maps, education platform, etc.) via Docker. This fork supports Windows using WSL2 and Docker Desktop, and native x86-64 and ARM64 Linux using Docker Engine.
 
 ## Development Commands
 
@@ -118,7 +118,7 @@ These are Docker containers managed by the Command Center UI:
 
 ## Windows/WSL2 Deployment
 
-This fork targets Windows via **WSL2 Ubuntu + Docker Desktop**. The install script (`install/install_nomad.sh`) detects WSL2 automatically via `grep -qi microsoft /proc/version` and adjusts its behavior:
+On Windows, this fork uses **WSL2 Ubuntu + Docker Desktop**. The install script (`install/install_nomad.sh`) detects WSL2 automatically via `grep -qi microsoft /proc/version` and adjusts its behavior:
 
 - **Docker:** Provided by Docker Desktop, not installed via apt. Script skips `systemctl` checks and uses `docker info` to verify the daemon.
 - **NVIDIA GPU:** Handled entirely by Docker Desktop + the NVIDIA Windows driver (525.60.13+). The script skips `nvidia-container-toolkit` installation and `daemon.json` modification on WSL2 — those are for native Linux only.

@@ -66,8 +66,9 @@ body {
   --color-desert-green-darker: #f7eedc;
   --color-desert-green-dark: #e8dfc8;
 
-  /* Accent green: slightly brighter for dark bg visibility */
+  /* Accent green remains dark enough for white text on buttons */
   --color-desert-green: #525530;
+  --color-desert-green-foreground: #babaaa;
 
   /* Light variants → dark variants (hover bg, disabled states) */
   --color-desert-green-light: #3a3c24;
@@ -120,19 +121,38 @@ body {
   color-scheme: dark;
 }
 
+/* Keep foreground accents readable without lightening green button backgrounds. */
+[data-theme="dark"] .text-desert-green {
+  color: var(--color-desert-green-foreground);
+}
+
+[data-theme="dark"] .hover\:text-desert-green:hover {
+  color: var(--color-desert-green-foreground);
+}
+
+[data-theme="dark"] .hover\:text-desert-green\/80:hover {
+  color: color-mix(in oklab, var(--color-desert-green-foreground) 80%, transparent);
+}
+
+[data-theme="dark"] .group-hover\:text-desert-green:is(:where(.group):hover *) {
+  color: var(--color-desert-green-foreground);
+}
+
 /* MapLibre popup styling for dark mode */
 [data-theme="dark"] .maplibregl-popup-content {
   background: #2a2918;
   color: #f7eedc;
 }
 
-[data-theme="dark"] .maplibregl-popup-content input {
+[data-theme="dark"] .maplibregl-popup-content input,
+[data-theme="dark"] .maplibregl-popup-content textarea {
   background: #353420;
   color: #f7eedc;
   border-color: #424420;
 }
 
-[data-theme="dark"] .maplibregl-popup-content input::placeholder {
+[data-theme="dark"] .maplibregl-popup-content input::placeholder,
+[data-theme="dark"] .maplibregl-popup-content textarea::placeholder {
   color: #8f8f82;
 }
 
@@ -155,4 +175,51 @@ body {
 [data-theme="dark"] .maplibregl-popup-close-button:hover {
   color: #f7eedc;
   background: #353420;
+}
+
+/* Base (hidden scrollbar + fade hint) */
+.themed-scrollbar {
+  scrollbar-width: none; /* Firefox */
+  mask-image: linear-gradient(
+    to bottom,
+    transparent,
+    black 8px,
+    black calc(100% - 8px),
+    transparent
+  );
+}
+
+/* Chrome / Safari */
+.themed-scrollbar::-webkit-scrollbar {
+  width: 0px;
+}
+
+/* Show scrollbar on hover OR focus */
+.themed-scrollbar:hover,
+.themed-scrollbar:focus {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-default) transparent;
+}
+
+.themed-scrollbar:hover::-webkit-scrollbar,
+.themed-scrollbar:focus::-webkit-scrollbar {
+  width: 8px;
+}
+
+.themed-scrollbar:hover::-webkit-scrollbar-track,
+.themed-scrollbar:focus::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.themed-scrollbar:hover::-webkit-scrollbar-thumb,
+.themed-scrollbar:focus::-webkit-scrollbar-thumb {
+  background-color: var(--color-border-default);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.themed-scrollbar:hover::-webkit-scrollbar-thumb:hover,
+.themed-scrollbar:focus::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-text-muted);
 }

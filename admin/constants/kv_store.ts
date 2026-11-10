@@ -1,3 +1,35 @@
 import { KVStoreKey } from "../types/kv_store.js";
 
-export const SETTINGS_KEYS: KVStoreKey[] = ['chat.suggestionsEnabled', 'chat.lastModel', 'ui.hasVisitedEasySetup', 'ui.theme', 'system.earlyAccess', 'ai.assistantCustomName', 'ai.remoteOllamaUrl', 'ai.ollamaFlashAttention', 'rag.defaultIngestPolicy'];
+export const SETTINGS_KEYS: KVStoreKey[] = [
+    'chat.suggestionsEnabled',
+    'chat.lastModel',
+    'ui.hasVisitedEasySetup',
+    'ui.theme',
+    'system.earlyAccess',
+    'system.internetStatusTestUrl',
+    'ai.assistantCustomName',
+    'ai.remoteOllamaUrl',
+    'ai.ollamaFlashAttention',
+    'ai.autoThinking',
+    'ai.tasksModel',
+    'ai.contextWindow',
+    'ai.keepAlive',
+    'ai.responseStyle',
+    'ai.amdHsaOverride',
+    'rag.defaultIngestPolicy',
+    'rag.enabled',
+    'rag.minRelevance',
+    'rag.relevanceCheck',
+    'autoUpdate.enabled',
+    'autoUpdate.windowStart',
+    'autoUpdate.windowEnd',
+    'autoUpdate.cooloffHours',
+    'appAutoUpdate.enabled',
+    'contentAutoUpdate.enabled',
+    'contentAutoUpdate.windowStart',
+    'contentAutoUpdate.windowEnd',
+    'contentAutoUpdate.cooloffHours',
+    'contentAutoUpdate.maxBytesPerWindow',
+    'benchmark.rerunBannerDismissed',
+    'apps.homebox.apiKeyPepper'
+];

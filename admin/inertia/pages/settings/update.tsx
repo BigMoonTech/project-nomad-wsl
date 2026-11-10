@@ -1,21 +1,21 @@
 import { Head } from '@inertiajs/react'
 import SettingsLayout from '~/layouts/SettingsLayout'
 import StyledButton from '~/components/StyledButton'
-import StyledTable from '~/components/StyledTable'
 import StyledSectionHeader from '~/components/StyledSectionHeader'
-import ActiveDownloads from '~/components/ActiveDownloads'
 import Alert from '~/components/Alert'
 import { useEffect, useRef, useState } from 'react'
 import { IconAlertCircle, IconArrowBigUpLines, IconCheck, IconCircleCheck, IconReload } from '@tabler/icons-react'
 import { SystemUpdateStatus } from '../../../types/system'
-import type { ContentUpdateCheckResult, ResourceUpdateInfo } from '../../../types/collections'
 import api from '~/lib/api'
 import Input from '~/components/inputs/Input'
 import Switch from '~/components/inputs/Switch'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation } from '@tanstack/react-query'
 import { useNotifications } from '~/context/NotificationContext'
 import { useSystemSetting } from '~/hooks/useSystemSetting'
-import { formatBytes } from '~/lib/util'
+import CoreAutoUpdateSection from '~/components/updates/CoreAutoUpdateSection'
+import AppAutoUpdateSection from '~/components/updates/AppAutoUpdateSection'
+import ContentAutoUpdateSection from '~/components/updates/ContentAutoUpdateSection'
+import ContentUpdatesSection from '~/components/updates/ContentUpdatesSection'
 
 type Props = {
   updateAvailable: boolean
@@ -40,222 +40,6 @@ const ADVANCED_STAGES: ReadonlySet<SystemUpdateStatus['stage']> = new Set([
   'recreating',
   'complete',
 ])
-
-function ContentUpdatesSection() {
-  const { addNotification } = useNotifications()
-  const queryClient = useQueryClient()
-  const [checkResult, setCheckResult] = useState<ContentUpdateCheckResult | null>(null)
-  const [isChecking, setIsChecking] = useState(false)
-  const [applyingIds, setApplyingIds] = useState<Set<string>>(new Set())
-  const [isApplyingAll, setIsApplyingAll] = useState(false)
-
-  const handleCheck = async () => {
-    setIsChecking(true)
-    try {
-      const result = await api.checkForContentUpdates()
-      if (result) {
-        setCheckResult(result)
-      }
-    } catch {
-      setCheckResult({
-        updates: [],
-        checked_at: new Date().toISOString(),
-        error: 'Failed to check for content updates',
-      })
-    } finally {
-      setIsChecking(false)
-    }
-  }
-
-  const handleApply = async (update: ResourceUpdateInfo) => {
-    setApplyingIds((prev) => new Set(prev).add(update.resource_id))
-    try {
-      const result = await api.applyContentUpdate(update)
-      if (result?.success) {
-        addNotification({ type: 'success', message: `Update started for ${update.resource_id}` })
-        // Remove from the updates list
-        setCheckResult((prev) =>
-          prev
-            ? { ...prev, updates: prev.updates.filter((u) => u.resource_id !== update.resource_id) }
-            : prev
-        )
-        // Force Active Downloads to refetch now — small updates finish before the next
-        // idle poll fires, so without this the user wouldn't see them.
-        queryClient.invalidateQueries({ queryKey: ['download-jobs'] })
-      } else {
-        addNotification({ type: 'error', message: result?.error || 'Failed to start update' })
-      }
-    } catch {
-      addNotification({ type: 'error', message: `Failed to start update for ${update.resource_id}` })
-    } finally {
-      setApplyingIds((prev) => {
-        const next = new Set(prev)
-        next.delete(update.resource_id)
-        return next
-      })
-    }
-  }
-
-  const handleApplyAll = async () => {
-    if (!checkResult?.updates.length) return
-    setIsApplyingAll(true)
-    try {
-      const result = await api.applyAllContentUpdates(checkResult.updates)
-      if (result?.results) {
-        const succeeded = result.results.filter((r) => r.success).length
-        const failed = result.results.filter((r) => !r.success).length
-        if (succeeded > 0) {
-          addNotification({ type: 'success', message: `Started ${succeeded} update(s)` })
-        }
-        if (failed > 0) {
-          addNotification({ type: 'error', message: `${failed} update(s) could not be started` })
-        }
-        // Remove successful updates from the list
-        const successIds = new Set(result.results.filter((r) => r.success).map((r) => r.resource_id))
-        setCheckResult((prev) =>
-          prev
-            ? { ...prev, updates: prev.updates.filter((u) => !successIds.has(u.resource_id)) }
-            : prev
-        )
-        if (successIds.size > 0) {
-          queryClient.invalidateQueries({ queryKey: ['download-jobs'] })
-        }
-      }
-    } catch {
-      addNotification({ type: 'error', message: 'Failed to apply updates' })
-    } finally {
-      setIsApplyingAll(false)
-    }
-  }
-
-  return (
-    <div className="mt-8">
-      <StyledSectionHeader title="Content Updates" />
-
-      <div className="bg-surface-primary rounded-lg border shadow-md overflow-hidden p-6">
-        <div className="flex items-center justify-between">
-          <p className="text-desert-stone-dark">
-            Check if newer versions of your installed ZIM files and maps are available.
-          </p>
-          <StyledButton
-            variant="primary"
-            icon="IconRefresh"
-            onClick={handleCheck}
-            loading={isChecking}
-          >
-            Check for Content Updates
-          </StyledButton>
-        </div>
-
-        {checkResult?.error && (
-          <Alert
-            type="warning"
-            title="Update Check Issue"
-            message={checkResult.error}
-            variant="bordered"
-            className="my-4"
-          />
-        )}
-
-        {checkResult && !checkResult.error && checkResult.updates.length === 0 && (
-          <Alert
-            type="success"
-            title="All Content Up to Date"
-            message="All your installed content is running the latest available version."
-            variant="bordered"
-            className="my-4"
-          />
-        )}
-
-        {checkResult && checkResult.updates.length > 0 && (
-          <div className="mt-4">
-            <div className="flex items-center justify-between mb-3">
-              <p className="text-sm text-desert-stone-dark">
-                {checkResult.updates.length} update(s) available
-              </p>
-              <StyledButton
-                variant="primary"
-                size="sm"
-                icon="IconDownload"
-                onClick={handleApplyAll}
-                loading={isApplyingAll}
-              >
-                Update All ({checkResult.updates.length})
-              </StyledButton>
-            </div>
-            <StyledTable
-              data={checkResult.updates}
-              columns={[
-                {
-                  accessor: 'resource_id',
-                  title: 'Title',
-                  render: (record) => (
-                    <span className="font-medium text-desert-green">{record.resource_id}</span>
-                  ),
-                },
-                {
-                  accessor: 'resource_type',
-                  title: 'Type',
-                  render: (record) => (
-                    <span
-                      className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${record.resource_type === 'zim'
-                        ? 'bg-blue-100 text-blue-800'
-                        : 'bg-emerald-100 text-emerald-800'
-                        }`}
-                    >
-                      {record.resource_type === 'zim' ? 'ZIM' : 'Map'}
-                    </span>
-                  ),
-                },
-                {
-                  accessor: 'size_bytes',
-                  title: 'Size',
-                  render: (record) => (
-                    <span className="text-desert-stone-dark">
-                      {record.size_bytes ? formatBytes(record.size_bytes, 1) : '—'}
-                    </span>
-                  ),
-                },
-                {
-                  accessor: 'installed_version',
-                  title: 'Version',
-                  render: (record) => (
-                    <span className="text-desert-stone-dark">
-                      {record.installed_version} → {record.latest_version}
-                    </span>
-                  ),
-                },
-                {
-                  accessor: 'resource_id',
-                  title: '',
-                  render: (record) => (
-                    <StyledButton
-                      variant="secondary"
-                      size="sm"
-                      icon="IconDownload"
-                      onClick={() => handleApply(record)}
-                      loading={applyingIds.has(record.resource_id)}
-                    >
-                      Update
-                    </StyledButton>
-                  ),
-                },
-              ]}
-            />
-          </div>
-        )}
-
-        {checkResult?.checked_at && (
-          <p className="text-xs text-desert-stone mt-3">
-            Last checked: {new Date(checkResult.checked_at).toLocaleString()}
-          </p>
-        )}
-      </div>
-
-      <ActiveDownloads withHeader />
-    </div>
-  )
-}
 
 export default function SystemUpdatePage(props: { system: Props }) {
   const { addNotification } = useNotifications()
@@ -455,7 +239,7 @@ export default function SystemUpdatePage(props: { system: Props }) {
           <div className="mb-8">
             <h1 className="text-4xl font-bold text-desert-green mb-2">System Update</h1>
             <p className="text-desert-stone-dark">
-              Keep your Project N.O.M.A.D. instance up to date with the latest features and
+              Keep your Project NOMAD instance up to date with the latest features and
               improvements.
             </p>
           </div>
@@ -503,7 +287,7 @@ export default function SystemUpdatePage(props: { system: Props }) {
                   </h2>
                   <p className="text-desert-stone-dark mb-6">
                     {versionInfo.updateAvailable
-                      ? `A new version (${versionInfo.latestVersion}) is available for your Project N.O.M.A.D. instance.`
+                      ? `A new version (${versionInfo.latestVersion}) is available for your Project NOMAD instance.`
                       : 'Your system is running the latest version!'}
                   </p>
                 </>
@@ -668,12 +452,15 @@ export default function SystemUpdatePage(props: { system: Props }) {
               description="Receive release candidate (RC) versions before they are officially released. Note: RC versions may contain bugs and are not recommended for environments where stability and data integrity are critical."
             />
           </div>
+          <CoreAutoUpdateSection />
+          <AppAutoUpdateSection />
+          <ContentAutoUpdateSection />
           <ContentUpdatesSection />
           <div className="bg-surface-primary rounded-lg border shadow-md overflow-hidden py-6 mt-12">
             <div className="flex flex-col md:flex-row justify-between items-center p-8 gap-y-8 md:gap-y-0 gap-x-8">
               <div>
                 <h2 className="max-w-xl text-lg font-bold text-desert-green sm:text-xl lg:col-span-7">
-                  Want to stay updated with the latest from Project N.O.M.A.D.? Subscribe to receive
+                  Want to stay updated with the latest from Project NOMAD? Subscribe to receive
                   release notes directly to your inbox. Unsubscribe anytime.
                 </h2>
               </div>
@@ -700,7 +487,7 @@ export default function SystemUpdatePage(props: { system: Props }) {
                   </StyledButton>
                 </div>
                 <p className="mt-2 text-sm text-desert-stone-dark">
-                  We care about your privacy. Project N.O.M.A.D. will never share your email with
+                  We care about your privacy. Project NOMAD will never share your email with
                   third parties or send you spam.
                 </p>
               </div>

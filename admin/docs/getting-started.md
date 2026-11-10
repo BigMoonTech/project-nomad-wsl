@@ -1,12 +1,61 @@
-# Getting Started with N.O.M.A.D.
+# Getting Started with NOMAD
 
-This guide will help you get the most out of your N.O.M.A.D. server.
+This guide will help you get the most out of your NOMAD server.
+
+---
+
+## System Requirements
+
+If you already have NOMAD running, you can skip this section. It is here for when you are planning a second server, moving to different hardware, or helping someone else get set up.
+
+### Operating System
+
+NOMAD runs on Debian-based Linux.
+
+| Support level | Operating system |
+|---|---|
+| **Recommended** | Ubuntu 26.04 LTS |
+| **Also supported** | Ubuntu 24.04 LTS, Debian 12 |
+| **Community-supported** | Windows via WSL2, other Debian derivatives |
+
+Ubuntu 26.04 LTS is the version we test on and the one we recommend for new installs. If you are already running 24.04 LTS or Debian 12, there is no need to reinstall, both are still supported.
+
+Ubuntu Desktop is the friendlier choice if you are coming from Windows or macOS. Ubuntu Server works just as well if you are comfortable at the terminal, and NOMAD does not need a desktop environment either way since everything is accessed through a browser.
+
+macOS and non-Debian distributions like Fedora or Arch are not officially supported.
+
+### Hardware
+
+NOMAD itself is lightweight. What drives your requirements is the content and tools you choose to install, and whether you want to run AI locally.
+
+**Minimum, without local AI:**
+
+- 2 GHz dual-core processor
+- 4 GB RAM
+- 5 GB free disk space, plus room for whatever content you download
+
+**Recommended, with local AI:**
+
+- AMD Ryzen 7 or Intel Core i7 or better
+- 32 GB RAM
+- NVIDIA RTX 3060 or AMD equivalent, more VRAM lets you run larger models
+- 250 GB or more of free disk space, preferably an SSD
+
+A stable internet connection is required during installation only. After that, NOMAD is designed to run fully offline.
+
+### A note on GPU drivers
+
+The installer sets up Docker and the NVIDIA Container Toolkit for you, but it does **not** install the GPU driver itself. You need that on the host beforehand.
+
+On Ubuntu, the easiest way is to check **"Install third-party drivers for graphics and Wi-Fi hardware"** during setup. If you skipped that, or you added the GPU later, install the driver first and then use **Force Reinstall** on the AI Assistant in the [Supply Depot](/supply-depot) to pick it up.
+
+Without a GPU, the AI Assistant still works. It just runs on the CPU, which is considerably slower.
 
 ---
 
 ## Easy Setup Wizard
 
-If this is your first time using N.O.M.A.D., the Easy Setup wizard will help you get everything configured.
+If this is your first time using NOMAD, the Easy Setup wizard will help you get everything configured.
 
 **[Launch Easy Setup →](/easy-setup)**
 
@@ -37,7 +86,7 @@ The Information Library stores compressed versions of websites and references th
 - Classic books from Project Gutenberg
 
 **How to use it:**
-1. Click **Information Library** from the Command Center home screen or [Apps](/settings/apps) page
+1. Click **Information Library** from the Command Center home screen or the [Supply Depot](/supply-depot)
 2. Choose a collection (like Wikipedia)
 3. Search or browse just like the regular website
 
@@ -54,7 +103,7 @@ The Education Platform provides complete educational courses that work offline.
 - Works for all ages
 
 **How to use it:**
-1. Click **Education Platform** from the Command Center home screen or [Apps](/settings/apps) page
+1. Click **Education Platform** from the Command Center home screen or the [Supply Depot](/supply-depot)
 2. Sign in or create a learner account
 3. Browse courses and start learning
 
@@ -66,7 +115,7 @@ The Education Platform provides complete educational courses that work offline.
 
 ![AI Chat interface](/docs/ai-chat.webp)
 
-N.O.M.A.D. includes a built-in AI chat interface powered by Ollama. It runs entirely on your server — no internet needed, no data sent anywhere.
+NOMAD includes a built-in AI chat interface powered by Ollama. It runs entirely on your server — no internet needed, no data sent anywhere.
 
 **What can it do:**
 - Answer questions on any topic
@@ -82,9 +131,9 @@ N.O.M.A.D. includes a built-in AI chat interface powered by Ollama. It runs enti
 
 **Tip:** Be specific in your questions. Instead of "tell me about plants," try "what vegetables grow well in shade?"
 
-**Note:** The AI Assistant must be installed first. Enable it during Easy Setup or install it from the [Apps](/settings/apps) page.
+**Note:** The AI Assistant must be installed first. Enable it during Easy Setup or install it from the [Supply Depot](/supply-depot).
 
-**GPU Acceleration:** If your server has an NVIDIA GPU with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed, N.O.M.A.D. will automatically use it for AI — dramatically faster responses (10-20x improvement). If you add a GPU later, go to [Apps](/settings/apps) and **Force Reinstall** the AI Assistant to enable it.
+**GPU Acceleration:** If your server has an NVIDIA GPU, NOMAD's installer sets up GPU support for you (it installs the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and configures Docker automatically). You only need the NVIDIA driver present on the host, which on Ubuntu you get by enabling "Install third-party drivers" during setup. With a GPU, AI responses are dramatically faster (10-20x improvement). If you add a GPU later, go to the [Supply Depot](/supply-depot) and **Force Reinstall** the AI Assistant to enable it.
 
 ---
 
@@ -141,7 +190,7 @@ View maps without internet. Download the regions you need before going offline.
 
 As your needs change, you can add more content anytime:
 
-- **More apps:** Settings → Apps
+- **More apps:** Settings → Supply Depot
 - **More references:** Settings → Content Explorer or Content Manager
 - **More map regions:** Settings → Maps Manager
 - **More educational content:** Through Kolibri's built-in content browser
@@ -150,7 +199,7 @@ As your needs change, you can add more content anytime:
 
 ![Content Explorer — browse and download Wikipedia packages and curated collections](/docs/content-explorer.webp)
 
-N.O.M.A.D. includes a dedicated Wikipedia content management tool for browsing and downloading Wikipedia packages.
+NOMAD includes a dedicated Wikipedia content management tool for browsing and downloading Wikipedia packages.
 
 **How to use it:**
 1. Go to **[Content Explorer →](/settings/zim/remote-explorer)**
@@ -183,6 +232,8 @@ While you have internet, periodically check for updates:
 3. Wait for the update to complete (your server will restart)
 
 Content updates (Wikipedia, maps, etc.) can be managed separately from software updates.
+
+**Automatic updates:** NOMAD can also keep itself current without you having to check. Software, installed apps, and content can each be set to update automatically on an opt-in basis, with safety checks and a time window you control. See the **[Updates guide](/docs/updates)** for the full picture.
 
 **Early Access Channel:** Want the latest features before they hit stable? Enable the Early Access Channel from the Check for Updates page to receive release candidate builds. You can switch back to stable anytime.
 
@@ -224,7 +275,7 @@ Check storage usage in **Settings → System**.
 
 ## Next Steps
 
-You're ready to use N.O.M.A.D. Here are some things to try:
+You're ready to use NOMAD Here are some things to try:
 
 1. **Look something up** — Search for a topic in the Information Library
 2. **Learn something** — Start a Khan Academy course in the Education Platform

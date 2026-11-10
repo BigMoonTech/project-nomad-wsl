@@ -2,24 +2,30 @@ name: Build Admin
 
 on: pull_request
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-        working-directory: ./admin
-
-      - name: Run build
-        run: npm run build
-        working-directory: ./admin
+      - uses: actions/checkout@v6
+      - name: Build and check native images
+        run: |
+          docker build --build-arg VERSION=ci -t nomad-admin:ci .
+          docker run --rm --entrypoint node nomad-admin:ci -e \
+            "require('@openzim/libzim'); require('sharp'); require('node:assert/strict').equal(require('./version.json').version, 'ci')"
+          docker run --rm --entrypoint pmtiles nomad-admin:ci version
+          docker build -t nomad-updater:ci install/sidecar-updater
+          docker run --rm --entrypoint docker nomad-updater:ci compose version
+          docker build -t nomad-collector:ci install/sidecar-disk-collector
+          docker run --rm --entrypoint lsblk nomad-collector:ci --version
+      - name: Fetch the previous WSL release fixture
+        if: runner.arch == 'X64'
+        run: git fetch --depth=1 origin tag v1.32.101
+      - name: Boot Command Center and verify migrations
+        run: bash .github/scripts/smoke-compose.sh

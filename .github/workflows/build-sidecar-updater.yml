@@ -13,28 +13,15 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
-    name: Build sidecar-updater image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: install/sidecar-updater
-          push: true
-          tags: |
-            ghcr.io/bigmoontech/project-nomad-wsl-sidecar-updater:${{ inputs.version }}
-            ghcr.io/bigmoontech/project-nomad-wsl-sidecar-updater:v${{ inputs.version }}
-            ${{ inputs.tag_latest && 'ghcr.io/bigmoontech/project-nomad-wsl-sidecar-updater:latest' || '' }}
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      image: project-nomad-wsl-sidecar-updater
+      context: install/sidecar-updater
+      version: ${{ inputs.version }}
+      tag_latest: ${{ inputs.tag_latest }}

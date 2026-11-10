@@ -13,28 +13,15 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
-    name: Build disk-collector image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: install/sidecar-disk-collector
-          push: true
-          tags: |
-            ghcr.io/bigmoontech/project-nomad-wsl-disk-collector:${{ inputs.version }}
-            ghcr.io/bigmoontech/project-nomad-wsl-disk-collector:v${{ inputs.version }}
-            ${{ inputs.tag_latest && 'ghcr.io/bigmoontech/project-nomad-wsl-disk-collector:latest' || '' }}
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      image: project-nomad-wsl-disk-collector
+      context: install/sidecar-disk-collector
+      version: ${{ inputs.version }}
+      tag_latest: ${{ inputs.tag_latest }}

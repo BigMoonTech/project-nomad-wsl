@@ -4,19 +4,104 @@ export const KV_STORE_SCHEMA = {
   'chat.lastModel':             'string',
   'rag.docsEmbedded':           'boolean',
   'rag.defaultIngestPolicy':    'string',
+  // Master switch for chat-time knowledge base retrieval. Unset/null means ON —
+  // the pre-existing behaviour. Turning it off skips the whole retrieval
+  // pipeline (hasDocuments, the query-rewrite LLM call, and the Qdrant search),
+  // which matters on small hardware and when the KB is small or empty.
+  'rag.enabled':                'boolean',
+  // Relevance floor for retrieved chunks, as a stringified number in [0,1]
+  // ("0.6"). Unset means "use RAG_MIN_FINAL_SCORE"; "0" explicitly means off.
+  // Stored as the number rather than a preset name so retuning the presets in
+  // Settings > Models cannot invalidate a value someone already saved.
+  'rag.minRelevance':           'string',
+  // Whether a model double-checks that retrieved chunks are about the question
+  // before they are injected and cited (#1341). Unset means OFF: the check costs
+  // a model call per turn and only pays off on ~8B-class models.
+  'rag.relevanceCheck':         'boolean',
   'system.updateAvailable':     'boolean',
   'system.latestVersion':       'string',
   'system.earlyAccess':         'boolean',
+  'system.internetStatusTestUrl': 'string',
+  'autoUpdate.enabled':         'boolean',
+  'autoUpdate.windowStart':     'string',
+  'autoUpdate.windowEnd':       'string',
+  'autoUpdate.cooloffHours':    'string',
+  'autoUpdate.lastAttemptAt':   'string',
+  'autoUpdate.lastError':       'string',
+  'autoUpdate.lastResult':      'string',
+  'autoUpdate.consecutiveFailures': 'string',
+  'autoUpdate.autoDisabledReason':  'string',
+  'appAutoUpdate.enabled':          'boolean',
+  'appAutoUpdate.lastAttemptAt':    'string',
+  'appAutoUpdate.lastResult':       'string',
+  'contentAutoUpdate.enabled':           'boolean',
+  'contentAutoUpdate.windowStart':       'string',
+  'contentAutoUpdate.windowEnd':         'string',
+  'contentAutoUpdate.cooloffHours':      'string',
+  'contentAutoUpdate.maxBytesPerWindow': 'string',
+  'contentAutoUpdate.lastAttemptAt':     'string',
+  'contentAutoUpdate.lastResult':        'string',
+  'contentAutoUpdate.lastError':         'string',
+  'contentAutoUpdate.consecutiveFailures': 'string',
+  'contentAutoUpdate.autoDisabledReason':  'string',
+  'contentAutoUpdate.windowBytesUsed':   'string',
+  'contentAutoUpdate.windowResetAt':     'string',
   'ui.hasVisitedEasySetup':     'boolean',
   'ui.theme':                   'string',
   'ai.assistantCustomName':     'string',
   'gpu.type':                   'string',
   'ai.remoteOllamaUrl':         'string',
   'ai.ollamaFlashAttention':    'boolean',
+  'ai.autoThinking':            'boolean',
+  // Model used for ancillary AI work (chat titles, chat suggestions) instead of
+  // whatever chat model the user last used. Unset/null keeps the previous
+  // behaviour: titles use the chat model, suggestions use chat.lastModel.
+  'ai.tasksModel':              'string',
+  // Learned per-model token-estimator corrections, as a JSON object keyed by
+  // model name ({"llama3:8b":1.02,"qwen2.5:0.5b":1.26}). One row rather than a
+  // key per model, since KVStoreKey is a closed union. Written by
+  // TokenCalibrationService from the `prompt_eval_count` every chat response
+  // already reports; safe to delete, it just re-learns.
+  'ai.tokenRatios':             'string',
+  // User cap on the chat context window, in tokens ("4096".."131072"), or
+  // "auto"/unset to let ContextWindowResolver size it from the model and the
+  // hardware. A cap only ever lowers the resolved value.
+  'ai.contextWindow':           'string',
+  // How long Ollama keeps a chat model (and its KV cache) resident after a
+  // request, in Ollama's duration format ("10m"). Unset inherits Ollama's 5m.
+  'ai.keepAlive':               'string',
+  // Sampler profile for chat replies: 'auto' | 'focused' | 'creative' | 'off'.
+  // Unset resolves to 'auto', which is NOMAD's baseline with any sampler values
+  // the model's author baked into their modelfile layered over it. 'off' sends
+  // no sampler settings at all, the behaviour from before the setting existed.
+  'ai.responseStyle':           'string',
   'ai.amdGpuAcceleration':      'boolean',
   'ai.amdHsaOverride':          'string',
   'ai.autoFixGpuPassthrough':   'boolean',
   'gpu.autoRemediatedAt':       'string',
+  'apps.homebox.apiKeyPepper':  'string',
+  'benchmark.rerunBannerDismissed': 'boolean',
+  // Drug Reference v1 — export_date of the last successfully completed
+  // openFDA drug-label ingest (e.g. "2026-06-06"). Written by
+  // IngestDrugDataJob on final-part completion; read by the search page's
+  // status panel to show "Last updated: <date>". Null when never ingested.
+  'drugReference.lastUpdatedExportDate': 'string',
+  // Drug Reference — two-step ingest download-state marker (no migration; status
+  // lives in job data + this KV key). Written by DownloadDrugDataJob after the
+  // LAST part lands on disk; a JSON string of DownloadStateMarker
+  // ({ export_date, totalParts, parts: [{ index, name, path, bytes }],
+  // completedAtMs }). Read by IngestDrugDataJob to rebuild the part list for a
+  // manual "Ingest into search" run (no manifest, no re-download) and by the
+  // service to gate POST /ingest. Parsed defensively (parseDownloadState) with a
+  // null fallback — the key simply doesn't exist before the first download.
+  // Cleared after a full ingest succeeds (when the on-disk parts are deleted).
+  'drugReference.downloadState': 'string',
+  // Drug Reference — affirmative-content gate (upstream #1040). Independent of
+  // the tier install: installing `medicine-standard` lights up the verbatim FDA
+  // label search and condition→OTC matching, but the hand-authored self-care and
+  // herbal REMEDY sections stay hidden until this flips true. Defaults off
+  // (null → false); flipped on after a clinician content-pass, not user-toggled.
+  'drugReference.remediesEnabled': 'boolean',
 } as const
 
 type KVTagToType<T extends string> = T extends 'boolean' ? boolean : string

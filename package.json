@@ -1,11 +1,11 @@
 {
   "name": "project-nomad",
-  "version": "1.32.100",
-  "description": "\"",
+  "version": "1.35.100",
+  "description": "Project NOMAD - an offline-first knowledge and education server.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "author": "BigMoonTech Fork of Crosstalk Solutions, LLC Original Project",
-  "license": "ISC"
+  "author": "BigMoonTech (fork of Crosstalk Solutions, LLC)",
+  "license": "Apache-2.0"
 }

@@ -1,4 +1,4 @@
-# BigMoonTech Project N.O.M.A.D. WSL2 Fork — Maintainer Playbook
+# BigMoonTech Project N.O.M.A.D. WSL2 and ARM64 Fork — Maintainer Playbook
 
 This is the operations guide for maintaining the fork: how it's wired together, how to release new versions, how to pull in upstream changes, and how to troubleshoot when things go sideways.
 
@@ -12,13 +12,13 @@ This is the operations guide for maintaining the fork: how it's wired together, 
 - **License:** Apache 2.0 (inherited from upstream — must keep)
 
 ### Container Registry (GHCR — GitHub Container Registry)
-All Docker images are published under `ghcr.io/bigmoontech/`:
+The three release images use a shared tag for native `linux/amd64` and `linux/arm64` builds. All three are published under `ghcr.io/bigmoontech/`:
 - `ghcr.io/bigmoontech/project-nomad-wsl` — the main admin/Command Center image
 - `ghcr.io/bigmoontech/project-nomad-wsl-sidecar-updater` — the updater sidecar (handles in-app updates)
 - `ghcr.io/bigmoontech/project-nomad-wsl-disk-collector` — the disk info collector sidecar
 
 ### Deployed Install
-- **Path on WSL2:** `/opt/project-nomad/`
+- **Path on WSL2 and native Linux:** `/opt/project-nomad/`
 - **Compose file:** `/opt/project-nomad/compose.yml` (downloaded from your fork at install time)
 - **Helper scripts:** `/opt/project-nomad/start_nomad.sh`, `stop_nomad.sh`, `update_nomad.sh`
 - **Storage:** `/opt/project-nomad/storage/` (ZIM files, uploads, logs)
@@ -127,11 +127,11 @@ chore(ci): tweak workflow
 docs: update README
 ```
 
-Push to `main` via GitHub Desktop.
+Merge the tested changes into the fork’s `main`. Both platforms ship from that commit.
 
 ### Step 2: Pick the new version number
 - Look at the previous release tag on https://github.com/BigMoonTech/project-nomad-wsl/releases
-- Bump appropriately (PATCH/MINOR/MAJOR per semver)
+- Apply the fork numbering rule in Part 2. Upstream 1.35.1 maps to fork 1.35.100.
 
 ### Step 3: Build all three Docker images
 **Go to:** https://github.com/BigMoonTech/project-nomad-wsl/actions
@@ -152,12 +152,24 @@ For each:
 Wait for all three to go ✅ green. Each takes 3–5 minutes. They run in parallel.
 
 ### Step 4: Verify images published
-Check these three URLs and confirm your new version appears:
-- https://github.com/BigMoonTech/project-nomad-wsl/pkgs/container/project-nomad-wsl
-- https://github.com/BigMoonTech/project-nomad-wsl/pkgs/container/project-nomad-wsl-sidecar-updater
-- https://github.com/BigMoonTech/project-nomad-wsl/pkgs/container/project-nomad-wsl-disk-collector
 
-Each should list your new version tag plus `latest` pointing to it.
+Check that all three runs succeeded on the same commit. For a stable release, verify that each alias resolves to the same manifest and both Linux architectures are present. Set `version` to the value supplied to the three workflows.
+
+```bash
+set -e
+version=1.35.100
+for suffix in '' -sidecar-updater -disk-collector; do
+  image="ghcr.io/bigmoontech/project-nomad-wsl${suffix}"
+  digest=$(docker buildx imagetools inspect "$image:$version" --format '{{.Manifest.Digest}}')
+  for alias in "v$version" latest; do
+    test "$(docker buildx imagetools inspect "$image:$alias" --format '{{.Manifest.Digest}}')" = "$digest"
+  done
+  docker buildx imagetools inspect "$image:$version" --raw | jq -e '
+    [.manifests[].platform | select(.os == "linux") | .architecture] | unique == ["amd64","arm64"]'
+done
+```
+
+For a prerelease, leave `tag_latest` off and verify only the versioned aliases.
 
 ### Step 5: Create the GitHub Release (THIS IS WHAT FLIPS THE UPDATE SWITCH)
 
@@ -173,7 +185,7 @@ Each should list your new version tag plus `latest` pointing to it.
 | Field | What to enter |
 |-------|---------------|
 | **Choose a tag** | Type the version with `v` prefix (e.g., `v1.32.1`). You'll see a "Create new tag: v1.32.1 on publish" option appear — click it. |
-| **Target** | Leave as `main` (default) |
+| **Target** | Select the exact commit built by the three workflows. |
 | **Previous tag** | Leave as `auto` (default) — GitHub picks the previous release |
 | **Release title** | `v1.32.1` (or `v1.32.1 — <short summary>` if you want) |
 | **Describe this release** | Use the template below |

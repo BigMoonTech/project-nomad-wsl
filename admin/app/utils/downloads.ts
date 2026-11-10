@@ -8,6 +8,32 @@ import { deleteFileIfExists, ensureDirectoryExists, getFileStatsIfExists } from 
 import { createWriteStream } from 'fs'
 import { rename } from 'fs/promises'
 import path from 'path'
+import logger from '@adonisjs/core/services/logger'
+
+/**
+ * A gated source rejected this install's credentials (401/403).
+ *
+ * Permanent by nature: whether the entitlement key is baked in is a property of
+ * the build, so no amount of retrying changes the answer. Declared here rather
+ * than thrown as an UnrecoverableError directly so this module stays free of a
+ * BullMQ dependency — RunDownloadJob translates it at the queue boundary.
+ */
+export class GatedContentAuthError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'GatedContentAuthError'
+  }
+}
+
+// Some upstream mirrors reject requests with a missing or generic User-Agent.
+// Notably, download.kiwix.org routes the large Wikimedia-family ZIMs (Wikipedia,
+// Wikiversity, Wikibooks — including the flagship full Wikipedia) to
+// dumps.wikimedia.org, which returns HTTP 403 for a default `axios/x` (or empty)
+// User-Agent per Wikimedia's UA policy. Identify ourselves descriptively so
+// those downloads succeed.
+const DOWNLOAD_HEADERS: Record<string, string> = {
+  'User-Agent': 'ProjectNOMAD/1.0 (+https://projectnomad.us)',
+}
 
 /**
  * Perform a resumable download with progress tracking
@@ -24,6 +50,7 @@ export async function doResumableDownload({
   onComplete,
   forceNew = false,
   allowedMimeTypes,
+  requestHeaders,
 }: DoResumableDownloadParams): Promise<string> {
   const dirname = path.dirname(filepath)
   await ensureDirectoryExists(dirname)
@@ -41,11 +68,33 @@ export async function doResumableDownload({
     appendMode = true
   }
 
-  // Get file info with HEAD request first
-  const headResponse = await axios.head(url, {
-    signal,
-    timeout,
-  })
+  // Merge default headers with any caller-supplied headers (e.g. Creator Packs' Authorization)
+  const headers: Record<string, string> = { ...DOWNLOAD_HEADERS, ...requestHeaders }
+
+  // Get file info with HEAD request first. Gated sources (Creator Packs) require
+  // the auth header on the HEAD too, or the probe 401s before the GET is reached.
+  let headResponse
+  try {
+    headResponse = await axios.head(url, {
+      signal,
+      timeout,
+      headers,
+    })
+  } catch (error: any) {
+    // A 401/403 from a gated source is not a network problem and the raw axios
+    // message ("Request failed with status code 401") reads like our server is
+    // broken. Translate it, because the actual cause is almost always a build
+    // without the entitlement key baked in — i.e. not an official release.
+    // failedReason is surfaced verbatim on the downloads UI.
+    const status = error?.response?.status
+    if (status === 401 || status === 403) {
+      throw new GatedContentAuthError(
+        'This content is hosted by Project NOMAD and requires an official release build. ' +
+          `The download server rejected this install's credentials (HTTP ${status}).`
+      )
+    }
+    throw error
+  }
 
   // Some upstream hosts (notably download.kiwix.org for .zim files) don't set a
   // Content-Type header at all. Per RFC 7231 §3.1.1.5, "if no Content-Type is
@@ -54,8 +103,8 @@ export async function doResumableDownload({
   // Without this default, the validator below throws `MIME type  is not allowed`
   // and breaks all downloads from kiwix's primary host (#848).
   const contentType =
-    headResponse.headers['content-type'] || 'application/octet-stream'
-  const totalBytes = parseInt(headResponse.headers['content-length'] || '0')
+    headResponse.headers['content-type']?.toString() || 'application/octet-stream'
+  const totalBytes = parseInt(headResponse.headers['content-length']?.toString() || '0', 10)
   const supportsRangeRequests = headResponse.headers['accept-ranges'] === 'bytes'
 
   // If allowedMimeTypes is provided, check content type
@@ -88,13 +137,32 @@ export async function doResumableDownload({
     appendMode = false
   }
 
-  const headers: Record<string, string> = {}
+  // A .tmp bigger than the file now on the server cannot be a prefix of it — the
+  // publisher replaced the file under the same name (openZIM rolls builds forward,
+  // see #1189/#1187). Resuming would ask for a range past the end and get a 416 on
+  // every attempt, with nothing deleting the .tmp, so the download could never
+  // recover on its own. Discard and start clean.
+  if (startByte > totalBytes && totalBytes > 0) {
+    logger.warn(
+      `[Download] Discarding stale partial for ${filepath}: .tmp is ${startByte}B but the server reports ${totalBytes}B`
+    )
+    await deleteFileIfExists(tempPath)
+    startByte = 0
+    appendMode = false
+  }
+
+  // Add Range header if resuming
   if (supportsRangeRequests && startByte > 0) {
     headers.Range = `bytes=${startByte}-`
   }
 
-  const fetchStream = (hdrs: Record<string, string>) =>
-    axios.get(url, { responseType: 'stream', headers: hdrs, signal, timeout })
+  const fetchStream = (headers: Record<string, string>) =>
+    axios.get(url, {
+      responseType: 'stream',
+      headers,
+      signal,
+      timeout,
+    })
 
   let response = await fetchStream(headers)
 

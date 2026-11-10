@@ -1,15 +1,49 @@
 import ChatSession from '#models/chat_session'
 import ChatMessage from '#models/chat_message'
+import KVStore from '#models/kv_store'
 import logger from '@adonisjs/core/services/logger'
 import { DateTime } from 'luxon'
 import { inject } from '@adonisjs/core'
 import { OllamaService } from './ollama_service.js'
 import { SYSTEM_PROMPTS } from '../../constants/ollama.js'
 import { toTitleCase } from '../utils/misc.js'
+import { resolveTasksModel } from '../utils/tasks_model.js'
+import {
+  SUGGESTIONS_SCHEMA,
+  TITLE_SCHEMA,
+  pickSuggestions,
+  pickTitle,
+  resolveStructured,
+} from '../utils/structured_output.js'
+import type { ChatSource } from '../../types/chat.js'
+
+/** Sidebar width, near enough. Applied once, to whichever candidate title won. */
+const TITLE_MAX_LENGTH = 57
+
+function truncateTitle(value: string): string {
+  return value.length > TITLE_MAX_LENGTH ? value.slice(0, TITLE_MAX_LENGTH) + '...' : value
+}
 
 @inject()
 export class ChatService {
   constructor(private ollamaService: OllamaService) {}
+
+  /**
+   * The model to use for ancillary work — chat titles and chat suggestions.
+   *
+   * Prefers the user's `ai.tasksModel` setting so a 30B reasoning model isn't
+   * spending seconds "thinking" to produce a three-word sidebar title. Falls
+   * back to `fallback` when the setting is unset (the default, which preserves
+   * the previous behaviour) or when the configured model is no longer
+   * installed. `installed` is passed in by callers that already listed models,
+   * to avoid a second round-trip.
+   */
+  private async resolveTasksModel(
+    fallback: string | null,
+    installed?: { name: string }[]
+  ): Promise<string | null> {
+    return resolveTasksModel(this.ollamaService, fallback, installed, '[ChatService]')
+  }
 
   async getAllSessions() {
     try {
@@ -36,17 +70,32 @@ export class ChatService {
         return [] // If no models are available, return empty suggestions
       }
 
-      // Larger models generally give "better" responses, so pick the largest one
-      const largestModel = models.reduce((prev, current) => {
-        return prev.size > current.size ? prev : current
-      })
+      // The user's dedicated tasks model wins when set — suggestions are short
+      // aesthetic prompts that don't benefit from a flagship model. Otherwise
+      // prefer the user's selected chat model, and fall back to the smallest
+      // installed model — picking the largest by file size is unsafe: if any
+      // installed model exceeds available VRAM (e.g. llama3.1:405b on a 96 GB
+      // GPU), Ollama spends minutes trying to load it and the request 500s.
+      const lastModel = await KVStore.getValue('chat.lastModel')
+      const preferred = lastModel ? models.find((m) => m.name === lastModel) : undefined
+      const chosen =
+        preferred ??
+        models.reduce((prev, current) => (prev.size < current.size ? prev : current))
 
-      if (!largestModel) {
+      if (!chosen) {
         return []
       }
 
+      const model = (await this.resolveTasksModel(chosen.name, models)) ?? chosen.name
+
+      // Suggestions are a formatting task, not a reasoning one. A reasoning tasks model
+      // would spend the whole response thinking and leave nothing to parse, so suppress
+      // it at the source; `thinkingCapable` is what lets the compat transport pick
+      // reasoning_effort:'none' rather than sending nothing. Memoized per model name.
+      const thinkingCapable = await this.ollamaService.checkModelHasThinking(model)
+
       const response = await this.ollamaService.chat({
-        model: largestModel.name,
+        model,
         messages: [
           {
             role: 'user',
@@ -54,11 +103,37 @@ export class ChatService {
           }
         ],
         stream: false,
+        think: false,
+        thinkingCapable,
+        // Grammar-constrained on the native transport, so the response is three
+        // strings in an array rather than whatever prose the model felt like.
+        format: SUGGESTIONS_SCHEMA,
+        // The default of 0.8 is actively hostile to format stability, and there is
+        // nothing creative about picking three canned opening questions.
+        temperature: 0,
       })
 
       if (response && response.message && response.message.content) {
         const content = response.message.content.trim()
-        
+
+        const structured = resolveStructured(content, pickSuggestions, response.structured === true)
+        if (structured.ok) {
+          return structured.value.map((s) => toTitleCase(s))
+        }
+        if (structured.reason === 'constrained-parse-failed') {
+          // The grammar was applied and the model broke it anyway, so what came back
+          // is a broken JSON object rather than prose. Splitting that on commas would
+          // surface `{"suggestions": ["How Do I` as a chip. No chips is the better
+          // failure — they are decorative, and the empty state is already designed.
+          logger.warn(
+            `[ChatService] Model "${model}" broke the suggestion grammar; returning no suggestions`
+          )
+          return []
+        }
+        logger.warn(
+          `[ChatService] Model "${model}" returned no suggestion JSON; falling back to text parsing`
+        )
+
         // Handle both comma-separated and newline-separated formats
         let suggestions: string[] = []
         
@@ -84,6 +159,9 @@ export class ChatService {
 
         return filtered.map((s) => toTitleCase(s))
       } else {
+        // Empty content after the <think> split means the model produced reasoning and
+        // nothing else. Log it rather than silently returning no chips.
+        logger.warn(`[ChatService] Model "${model}" returned no usable suggestion text`)
         return []
       }
     } catch (error) {
@@ -114,6 +192,7 @@ export class ChatService {
           role: msg.role,
           content: msg.content,
           timestamp: msg.created_at.toJSDate(),
+          sources: msg.sources ? JSON.parse(msg.sources) : undefined,
         })),
       }
     } catch (error) {
@@ -176,12 +255,18 @@ export class ChatService {
     }
   }
 
-  async addMessage(sessionId: number, role: 'system' | 'user' | 'assistant', content: string) {
+  async addMessage(
+    sessionId: number,
+    role: 'system' | 'user' | 'assistant',
+    content: string,
+    sources?: ChatSource[]
+  ) {
     try {
       const message = await ChatMessage.create({
         session_id: sessionId,
         role,
         content,
+        sources: sources && sources.length > 0 ? JSON.stringify(sources) : null,
       })
 
       // Update session's updated_at timestamp
@@ -194,6 +279,7 @@ export class ChatService {
         role: message.role,
         content: message.content,
         timestamp: message.created_at.toJSDate(),
+        sources: sources && sources.length > 0 ? sources : undefined,
       }
     } catch (error) {
       logger.error(
@@ -234,21 +320,65 @@ export class ChatService {
 
   async generateTitle(sessionId: number, userMessage: string, assistantMessage: string, model: string) {
     try {
-      let title: string
+      // Titles are aesthetic work; route them to the tasks model when one is
+      // configured rather than the chat model that just answered.
+      const titleModel = (await this.resolveTasksModel(model)) ?? model
+
+      // Naming a chat needs no reasoning; see the note in getChatSuggestions.
+      const thinkingCapable = await this.ollamaService.checkModelHasThinking(titleModel)
 
       const response = await this.ollamaService.chat({
-        model,
+        model: titleModel,
         messages: [
           { role: 'system', content: SYSTEM_PROMPTS.title_generation },
           { role: 'user', content: userMessage },
           { role: 'assistant', content: assistantMessage },
         ],
+        think: false,
+        thinkingCapable,
+        format: TITLE_SCHEMA,
+        // See the note on suggestions: naming a chat is not a creative task, and
+        // the backend default of 0.8 makes the format wobble.
+        temperature: 0,
       })
 
-      title = response?.message?.content?.trim()
-      if (!title) {
-        title = userMessage.slice(0, 57) + (userMessage.length > 57 ? '...' : '')
+      const content = response?.message?.content?.trim() ?? ''
+      const structured = resolveStructured(content, pickTitle, response?.structured === true)
+
+      let title: string
+      if (!content) {
+        // Nothing left once reasoning was split out. Checked before the grammar branch
+        // so the log says what actually happened rather than blaming the schema.
+        logger.warn(
+          `[ChatService] Model "${titleModel}" returned no usable title text; using the user message`
+        )
+        title = userMessage
+      } else if (structured.ok) {
+        title = structured.value
+      } else if (structured.reason === 'constrained-parse-failed') {
+        // A truncated object would otherwise be stored verbatim, leaving `{"title": ...`
+        // in the sidebar. The user's own words are a worse title than the model's but a
+        // far better one than a JSON fragment.
+        logger.warn(
+          `[ChatService] Model "${titleModel}" broke the title grammar; using the user message`
+        )
+        title = userMessage
+      } else {
+        // Unconstrained backend: the response is meant to be the bare title.
+        title = content
       }
+
+      if (!title) {
+        // An unconstrained response that was pure punctuation or whitespace.
+        logger.warn(
+          `[ChatService] Model "${titleModel}" returned no usable title text; using the user message`
+        )
+        title = userMessage
+      }
+
+      // Applied once, to whichever string won: "under 50 characters" is a request the
+      // model can ignore on the schema path and the text path alike.
+      title = truncateTitle(title)
 
       await this.updateSession(sessionId, { title })
       logger.info(`[ChatService] Generated title for session ${sessionId}: "${title}"`)
@@ -258,8 +388,7 @@ export class ChatService {
       )
       // Fall back to truncated user message
       try {
-        const fallbackTitle = userMessage.slice(0, 57) + (userMessage.length > 57 ? '...' : '')
-        await this.updateSession(sessionId, { title: fallbackTitle })
+        await this.updateSession(sessionId, { title: truncateTitle(userMessage) })
       } catch {
         // Silently fail - session keeps "New Chat" title
       }
