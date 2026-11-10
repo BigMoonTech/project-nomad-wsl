@@ -144,6 +144,11 @@
     "yaml": "2.8.3",
     "yauzl": "3.2.0"
   },
+  "overrides": {
+    "@adonisjs/ace": {
+      "jsonschema": "1.4.1"
+    }
+  },
   "hotHook": {
     "boundaries": [
       "./app/controllers/**/*.ts",

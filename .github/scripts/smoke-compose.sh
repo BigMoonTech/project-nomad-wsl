@@ -47,10 +47,34 @@ if [[ $(uname -m) == x86_64 ]]; then
   boot
   "${compose[@]}" exec -T mysql mysql -unomad_user -ptest nomad \
     -e "INSERT INTO kv_store (\`key\`, value) VALUES ('smoke.upgrade', 'persisted')"
+  "${compose[@]}" stop admin
 fi
 
 configure install/management_compose.yaml nomad-admin:ci
+# Queue a download before the new worker boots, as on a restart with pending
+# Easy Setup jobs. The HTTP health check alone stays green when Ace fails.
+"${compose[@]}" up -d --wait redis
+"${compose[@]}" run --rm -T --no-deps --entrypoint node admin --input-type=module <<'NODE'
+import { Queue } from 'bullmq'
+const queue = new Queue('downloads', { connection: { host: process.env.REDIS_HOST, port: Number(process.env.REDIS_PORT) } })
+await queue.add('run-download', {
+  url: 'http://127.0.0.1:8080/favicon-16x16.png',
+  filepath: '/app/storage/worker-smoke.png',
+}, { attempts: 10, backoff: { type: 'fixed', delay: 1000 } })
+await queue.close()
+NODE
 boot
+"${compose[@]}" exec -T admin sh -ec '
+  for i in $(seq 1 45); do
+    if test -f /app/storage/worker-smoke.png; then
+      cmp /app/public/favicon-16x16.png /app/storage/worker-smoke.png
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "The worker did not finish the queued download" >&2
+  exit 1
+'
 if [[ $(uname -m) == x86_64 ]]; then
   value=$("${compose[@]}" exec -T mysql mysql -unomad_user -ptest -Ns nomad \
     -e "SELECT value FROM kv_store WHERE \`key\` = 'smoke.upgrade'")
