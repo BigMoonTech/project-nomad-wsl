@@ -113,7 +113,7 @@ _models: dict[str, object] = {}
 def _bergamot():
     global _service
     if _service is None:
-        from bergamot import Service, ServiceConfig
+        from _bergamot import Service, ServiceConfig
 
         _service = Service(ServiceConfig(numWorkers=WORKERS, logLevel="off"))
     return _service
@@ -126,7 +126,7 @@ def model(pair: str):
 
 
 def translate_blocks(pair: str, jobs: list[str]) -> list[str]:
-    from bergamot import ResponseOptions, VectorString
+    from _bergamot import ResponseOptions, VectorString
 
     options = ResponseOptions(HTML=True)
     responses = _bergamot().translate(model(pair), VectorString(jobs), options)

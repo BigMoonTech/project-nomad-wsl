@@ -26,8 +26,11 @@ ARG TARGETARCH
 RUN if [ "$TARGETARCH" = arm64 ]; then \
       apt-get update && apt-get install -y --no-install-recommends libpcre2-8-0 libopenblas0-pthread libgomp1 && rm -rf /var/lib/apt/lists/*; \
     fi
-RUN --mount=from=wheels,source=/wheels,target=/wheels \
-    pip install --no-cache-dir /wheels/*.whl && python -c 'from bergamot import Service, ServiceConfig'
+# The Python CLI wrapper fetches third-party model catalogs on import. The proxy
+# already manages its models, so load the wheel's native extension directly.
+ENV PYTHONPATH=/usr/local/lib/python3.10/site-packages/bergamot
+RUN --network=none --mount=from=wheels,source=/wheels,target=/wheels \
+    pip install --no-index --no-deps /wheels/*.whl && python -c 'from _bergamot import Service, ServiceConfig'
 
 WORKDIR /app
 COPY blocks.py proxy.py fetch_models.py entrypoint.sh /app/
