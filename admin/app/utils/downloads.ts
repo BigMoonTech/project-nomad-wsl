@@ -2,13 +2,12 @@ import {
   DoResumableDownloadParams,
   DoResumableDownloadWithRetryParams,
 } from '../../types/downloads.js'
-import axios from 'axios'
+import axios, { type AxiosInstance } from 'axios'
 import { Transform } from 'stream'
 import { deleteFileIfExists, ensureDirectoryExists, getFileStatsIfExists } from './fs.js'
 import { createWriteStream } from 'fs'
 import { rename } from 'fs/promises'
 import path from 'path'
-import logger from '@adonisjs/core/services/logger'
 
 /**
  * A gated source rejected this install's credentials (401/403).
@@ -51,7 +50,7 @@ export async function doResumableDownload({
   forceNew = false,
   allowedMimeTypes,
   requestHeaders,
-}: DoResumableDownloadParams): Promise<string> {
+}: DoResumableDownloadParams, client: AxiosInstance = axios): Promise<string> {
   const dirname = path.dirname(filepath)
   await ensureDirectoryExists(dirname)
 
@@ -75,7 +74,7 @@ export async function doResumableDownload({
   // the auth header on the HEAD too, or the probe 401s before the GET is reached.
   let headResponse
   try {
-    headResponse = await axios.head(url, {
+    headResponse = await client.head(url, {
       signal,
       timeout,
       headers,
@@ -143,6 +142,7 @@ export async function doResumableDownload({
   // every attempt, with nothing deleting the .tmp, so the download could never
   // recover on its own. Discard and start clean.
   if (startByte > totalBytes && totalBytes > 0) {
+    const { default: logger } = await import('@adonisjs/core/services/logger')
     logger.warn(
       `[Download] Discarding stale partial for ${filepath}: .tmp is ${startByte}B but the server reports ${totalBytes}B`
     )
@@ -157,7 +157,7 @@ export async function doResumableDownload({
   }
 
   const fetchStream = (headers: Record<string, string>) =>
-    axios.get(url, {
+    client.get(url, {
       responseType: 'stream',
       headers,
       signal,
