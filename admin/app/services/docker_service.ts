@@ -804,11 +804,11 @@ export class DockerService {
             )
             logger.info('[DockerService] AMD GPU acceleration disabled by KV opt-out; using CPU-only configuration.')
           }
-        } else if (gpuResult.toolkitMissing) {
+        } else if (gpuResult.nvidiaUnavailable) {
           this._broadcast(
             service.service_name,
             'gpu-config',
-            `NVIDIA GPU detected but NVIDIA Container Toolkit is not installed. Using CPU-only configuration. Install the toolkit and reinstall AI Assistant for GPU acceleration: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html`
+            `NVIDIA hardware was detected, but the Docker GPU check failed. Using CPU. Verify GPU access in Docker Desktop on Windows or the NVIDIA Container Toolkit on native Linux, then reinstall AI Assistant.`
           )
         } else {
           this._broadcast(
@@ -1464,7 +1464,12 @@ export class DockerService {
   // Docker Desktop can register the NVIDIA runtime on machines without a usable GPU.
   // Probe with the local admin image so this also works after the host goes offline.
   private async _canUseNvidiaGpu(): Promise<boolean> {
-    const admin = await this.docker.getContainer(DockerService.ADMIN_CONTAINER_NAME).inspect()
+    // Docker defaults the hostname to the container ID. The compose name
+    // also works when the operator overrides the hostname.
+    const admin = await this.docker.getContainer(os.hostname()).inspect().catch((error) => {
+      if (error.statusCode !== 404) throw error
+      return this.docker.getContainer(DockerService.ADMIN_CONTAINER_NAME).inspect()
+    })
     const probe = await this.docker.createContainer({
       Image: admin.Image,
       Entrypoint: ['/bin/sh', '-c'],
@@ -1489,13 +1494,13 @@ export class DockerService {
    *   AMD has no Docker runtime registration to query.
    * Fallback: lspci for host-based installs.
    */
-  private async _detectGPUType(): Promise<{ type: 'nvidia' | 'amd' | 'none'; toolkitMissing?: boolean }> {
+  private async _detectGPUType(): Promise<{ type: 'nvidia' | 'amd' | 'none'; nvidiaUnavailable?: boolean }> {
     try {
       // Primary: Check Docker daemon for nvidia runtime (works from inside containers)
       try {
         const dockerInfo = await this.docker.info()
         const runtimes = dockerInfo.Runtimes || {}
-        if ('nvidia' in runtimes && await this._canUseNvidiaGpu()) {
+        if ('nvidia' in runtimes && (await this._canUseNvidiaGpu())) {
           logger.info('[DockerService] NVIDIA GPU accessible from a Docker container')
           await this._persistGPUType('nvidia')
           return { type: 'nvidia' }
@@ -1509,9 +1514,9 @@ export class DockerService {
       try {
         const marker = (await readFile('/app/storage/.nomad-gpu-type', 'utf8')).trim()
         if (marker === 'nvidia') {
-          // Hardware present but Docker doesn't have nvidia runtime → toolkit missing
-          logger.warn('[DockerService] NVIDIA GPU recorded in marker file but NVIDIA Container Toolkit is not installed')
-          return { type: 'none', toolkitMissing: true }
+          // The marker records hardware even when the current driver or runtime cannot use it.
+          logger.warn('[DockerService] NVIDIA GPU recorded in marker file but Docker GPU access could not be verified')
+          return { type: 'none', nvidiaUnavailable: true }
         }
         if (marker === 'amd') {
           logger.info('[DockerService] AMD GPU detected via install-time marker file')
@@ -1528,12 +1533,12 @@ export class DockerService {
       // Check for NVIDIA GPU via lspci
       try {
         const { stdout: nvidiaCheck } = await execAsync(
-          'lspci 2>/dev/null | grep -i nvidia || true'
+          'lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -i nvidia || true'
         )
         if (nvidiaCheck.trim()) {
           // GPU hardware found but no nvidia runtime — toolkit not installed
-          logger.warn('[DockerService] NVIDIA GPU detected via lspci but NVIDIA Container Toolkit is not installed')
-          return { type: 'none', toolkitMissing: true }
+          logger.warn('[DockerService] NVIDIA GPU detected via lspci but Docker GPU access could not be verified')
+          return { type: 'none', nvidiaUnavailable: true }
         }
       } catch (error: any) {
         // lspci not available (likely inside Docker container), continue
@@ -1559,9 +1564,9 @@ export class DockerService {
       // hiccup, runtime temporarily unavailable) but the hardware hasn't changed.
       try {
         const savedType = await KVStore.getValue('gpu.type')
-        if (savedType === 'nvidia' || savedType === 'amd') {
+        if (savedType === 'amd') {
           logger.info(`[DockerService] No GPU detected live, but KV store has '${savedType}' from previous detection. Using saved value.`)
-          return { type: savedType as 'nvidia' | 'amd' }
+          return { type: savedType }
         }
       } catch {
         // KV store not available, continue
@@ -1830,11 +1835,11 @@ export class DockerService {
               `AMD GPU detected but acceleration is disabled via ai.amdGpuAcceleration. Using CPU-only configuration.`
             )
           }
-        } else if (gpuResult.toolkitMissing) {
+        } else if (gpuResult.nvidiaUnavailable) {
           this._broadcast(
             serviceName,
             'update-gpu-config',
-            `NVIDIA GPU detected but NVIDIA Container Toolkit is not installed. Using CPU-only configuration. Install the toolkit and reinstall AI Assistant for GPU acceleration: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html`
+            `NVIDIA hardware was detected, but the Docker GPU check failed. Using CPU. Verify GPU access in Docker Desktop on Windows or the NVIDIA Container Toolkit on native Linux, then reinstall AI Assistant.`
           )
         } else {
           this._broadcast(serviceName, 'update-gpu-config', `No GPU detected. Using CPU-only configuration.`)
