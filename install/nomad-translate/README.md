@@ -66,12 +66,10 @@ restart on a genuinely offline box does not fail. A failed fetch is non-fatal:
 the proxy still starts and still forwards the library, untranslated. Translation
 being unavailable must never make the Information Library unreachable.
 
-## amd64 only
+## CPU architectures
 
-Not just packaging. Bergamot's `intgemm` backend is x86 specific and there is no
-aarch64 wheel; ARM would need marian's `ruy` path. The build workflow pins
-`linux/amd64` so this fails at build time rather than producing an image that
-pulls cleanly on ARM and dies at start.
+The fork publishes one image tag for Linux amd64 and arm64. Both run the Python proxy and the same Firefox translation models. The amd64 image installs the Bergamot wheel. The ARM64 image builds the Python binding from a pinned Bergamot revision with Marian’s ruy backend and targets ARMv8-A so it also runs on DGX Spark. The primary image workflow publishes the translation image alongside the Command Center.
+
 
 ## Known gaps
 

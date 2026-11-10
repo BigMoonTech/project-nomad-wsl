@@ -38,7 +38,7 @@ sudo bash install_nomad.sh
 
 Run Quick Install above in the host terminal. DGX Spark ships with Docker Engine and the NVIDIA Container Toolkit. Check `sudo docker info` and `sudo docker compose version` first. To check GPU access from a container, run `sudo docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L`. See the [DGX Spark container runtime guide](https://docs.nvidia.com/dgx/dgx-spark/nvidia-container-runtime-for-docker.html).
 
-Open `http://localhost:8080` after installation. AI Assistant and the Information Library have native ARM64 images. Supply Depot omits the pinned x86-only Excalidraw and Translated Library images on ARM64. Existing installations on either platform receive releases through Settings → Check for Updates.
+Open `http://localhost:8080` after installation. AI Assistant and the Information Library have native ARM64 images. Supply Depot includes the official multi-platform Excalidraw editor and an offline Translated Library with a native Bergamot engine on each architecture. Existing installations on either platform receive releases through Settings → Check for Updates.
 
 ### Windows Install (WSL2 + Docker Desktop)
 

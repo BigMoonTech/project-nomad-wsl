@@ -18,7 +18,6 @@ import {
   JELLYFIN_MEDIA_SUBFOLDERS,
 } from '../utils/fs.js'
 import { KiwixLibraryService } from './kiwix_library_service.js'
-import { requiresAmd64 } from '../utils/curated_platform.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { exec } from 'child_process'
 import { promisify } from 'util'
@@ -291,10 +290,6 @@ export class DockerService {
       }
     }
 
-    if (requiresAmd64(service)) {
-      return { success: false, message: `The catalog image for ${service.friendly_name} requires an x86-64 host.` }
-    }
-
     if (service.installed) {
       return {
         success: false,
@@ -367,10 +362,6 @@ export class DockerService {
           success: false,
           message: `Service ${serviceName} not found`,
         }
-      }
-
-      if (requiresAmd64(service)) {
-        return { success: false, message: `The catalog image for ${service.friendly_name} requires an x86-64 host.` }
       }
 
       // Check if installation is already in progress
@@ -1470,6 +1461,26 @@ export class DockerService {
     }
   }
 
+  // Docker Desktop can register the NVIDIA runtime on machines without a usable GPU.
+  // Probe with the local admin image so this also works after the host goes offline.
+  private async _canUseNvidiaGpu(): Promise<boolean> {
+    const admin = await this.docker.getContainer(DockerService.ADMIN_CONTAINER_NAME).inspect()
+    const probe = await this.docker.createContainer({
+      Image: admin.Image,
+      Entrypoint: ['/bin/sh', '-c'],
+      Cmd: ['timeout 15 nvidia-smi -L | grep -q "^GPU "'],
+      NetworkDisabled: true,
+      HostConfig: { DeviceRequests: [{ Driver: 'nvidia', Count: -1, Capabilities: [['gpu']] }] },
+    })
+    try {
+      await probe.start()
+      const result = await probe.wait()
+      return result.StatusCode === 0
+    } finally {
+      await probe.remove({ force: true })
+    }
+  }
+
   /**
    * Detect GPU type and toolkit availability.
    * Primary: Check Docker runtimes via docker.info() (works from inside containers).
@@ -1484,13 +1495,13 @@ export class DockerService {
       try {
         const dockerInfo = await this.docker.info()
         const runtimes = dockerInfo.Runtimes || {}
-        if ('nvidia' in runtimes) {
-          logger.info('[DockerService] NVIDIA container runtime detected via Docker API')
+        if ('nvidia' in runtimes && await this._canUseNvidiaGpu()) {
+          logger.info('[DockerService] NVIDIA GPU accessible from a Docker container')
           await this._persistGPUType('nvidia')
           return { type: 'nvidia' }
         }
       } catch (error: any) {
-        logger.warn(`[DockerService] Could not query Docker info for GPU runtimes: ${error.message}`)
+        logger.warn(`[DockerService] Could not verify Docker GPU access: ${error.message}`)
       }
 
       // Secondary: install_nomad.sh writes the host-detected GPU type to a marker file in

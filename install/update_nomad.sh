@@ -90,22 +90,14 @@ ensure_docker_installed_and_running() {
     exit 1
   fi
 
-  if grep -qi microsoft /proc/version 2>/dev/null; then
-    # WSL2 — Docker is provided by Docker Desktop, no systemd service
-    if ! docker info &> /dev/null; then
-      echo -e "${RED}#${RESET} Docker is not responding. Please ensure Docker Desktop is running on Windows."
-      exit 1
-    fi
-  else
-    # Native Linux
-    if ! systemctl is-active --quiet docker; then
-      echo -e "${RED}#${RESET} Docker is not running. Attempting to start Docker..."
-      sudo systemctl start docker
-      if ! systemctl is-active --quiet docker; then
-        echo -e "${RED}#${RESET} Failed to start Docker. Please start Docker and try again."
-        exit 1
-      fi
-    fi
+  if docker info >/dev/null 2>&1; then return 0; fi
+  if grep -qi microsoft /proc/version; then
+    echo "Start Docker Desktop on Windows and enable WSL integration for this distribution." >&2
+    exit 1
+  fi
+  if ! sudo systemctl start docker || ! docker info >/dev/null; then
+    echo "Cannot reach the local Docker Engine." >&2
+    exit 1
   fi
 }
 

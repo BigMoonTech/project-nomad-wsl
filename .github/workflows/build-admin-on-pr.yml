@@ -14,6 +14,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+      - name: Check installer platform detection
+        run: bash .github/scripts/test-installer.sh
       - name: Build and check native images
         run: |
           docker build --build-arg VERSION=ci -t nomad-admin:ci .
@@ -29,3 +31,12 @@ jobs:
         run: git fetch --depth=1 origin tag v1.32.101
       - name: Boot Command Center and verify migrations
         run: bash .github/scripts/smoke-compose.sh
+      - name: Check native offline translation
+        run: |
+          docker build -t nomad-translate:ci install/nomad-translate
+          docker volume create translate-models
+          docker run --rm -v translate-models:/models -e TRANSLATE_LANGS=es --entrypoint python nomad-translate:ci fetch_models.py
+          docker run --rm --network none -v translate-models:/models:ro --entrypoint python nomad-translate:ci -c '
+          import proxy
+          result = proxy.translate_blocks("enes", ["Hello, how are you?", "This is a <b>house</b>."])
+          assert "hola" in result[0].lower() and "<b>" in result[1] and "casa" in result[1], result'

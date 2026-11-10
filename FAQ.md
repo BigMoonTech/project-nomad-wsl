@@ -47,7 +47,7 @@ Support for other operating systems will come in the future, but because our dev
 For Windows users, the [WSL2 install guide](https://www.projectnomad.us/install/wsl2) provides a community-supported path. Community members have also published guides for other platforms (e.g. macOS) in our Discord community and [Github Discussions](https://github.com/Crosstalk-Solutions/project-nomad/discussions), so if you're interested in running NOMAD on a non-Debian-based system, we recommend checking there for any available resources or guides. However, keep in mind that if you choose to run NOMAD on a non-Debian-based system, you may encounter issues that we won't be able to provide support for, and you may need to have a higher level of technical expertise to troubleshoot and resolve any problems that arise.
 
 ## Can I run NOMAD on a Raspberry Pi or other ARM-based device?
-This fork builds the Command Center, updater and disk collector for ARM64 and x86-64. DGX Spark uses the native Debian/Ubuntu installer with Docker Engine. 32-bit ARM systems are unsupported. Excalidraw and Translated Library currently have x86-only catalog images. See the [native ARM64 installation instructions](README.md#dgx-spark-and-other-native-arm64-linux-hosts).
+This fork builds the Command Center, updater and disk collector for ARM64 and x86-64. DGX Spark uses the native Debian/Ubuntu installer with Docker Engine. 32-bit ARM systems are unsupported. Excalidraw and Translated Library both run on ARM64. See the [native ARM64 installation instructions](README.md#dgx-spark-and-other-native-arm64-linux-hosts).
 
 ## What are the hardware requirements for running NOMAD?
 

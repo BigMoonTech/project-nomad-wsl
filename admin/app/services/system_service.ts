@@ -11,7 +11,6 @@ import {
   NomadDiskInfoRaw,
   SystemInformationResponse,
 } from '../../types/system.js'
-import { requiresAmd64 } from '../utils/curated_platform.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
@@ -331,8 +330,6 @@ export class SystemService {
     const toReturn: ServiceSlim[] = []
 
     for (const service of services) {
-      // Keep existing installations visible so owners can manage or remove them.
-      if (!service.installed && requiresAmd64(service)) continue
       const status = statuses.find((s) => s.service_name === service.service_name)
       toReturn.push({
         id: service.id,

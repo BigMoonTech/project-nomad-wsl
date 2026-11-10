@@ -366,7 +366,8 @@ export default class ServiceSeeder extends BaseSeeder {
       display_order: 24,
       description: 'Virtual whiteboard for sketching hand-drawn-style diagrams — works fully offline',
       icon: 'IconPencil',
-      container_image: 'excalidraw/excalidraw:sha-4bfc5bb',
+      // Excalidraw publishes its multi-platform release under latest. Its sha-* tags are amd64-only.
+      container_image: 'excalidraw/excalidraw:latest',
       source_repo: 'https://github.com/excalidraw/excalidraw',
       container_command: null,
       container_config: JSON.stringify({
@@ -550,7 +551,7 @@ export default class ServiceSeeder extends BaseSeeder {
       description:
         'Read the Information Library in another language. Machine translation that works offline, on CPU',
       icon: 'IconWorld',
-      container_image: 'ghcr.io/crosstalk-solutions/project-nomad-translate:0.1.1',
+      container_image: 'ghcr.io/bigmoontech/project-nomad-wsl-translate:1.35.100',
       source_repo: 'https://github.com/browsermt/bergamot-translator',
       container_command: null,
       container_config: JSON.stringify({

@@ -16,9 +16,11 @@ about 140 MB (Korean) per language. Chinese is published under region codes
 (zh-Hans, zh-Hant) that the proxy's two-letter language codes cannot carry yet.
 """
 
+import hashlib
 import json
 import os
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -103,6 +105,40 @@ def choose_files(data: list[dict], src: str, dst: str) -> dict[str, dict] | None
     return None
 
 
+def fetch_attachment(url: str, dest: Path, attachment: dict) -> None:
+    """Resume interrupted transfers and expose a file only after SHA-256 verification."""
+    expected = attachment["size"]
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    failures = 0
+    while not tmp.exists() or tmp.stat().st_size < expected:
+        offset = tmp.stat().st_size if tmp.exists() else 0
+        request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"})
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                if response.status == 206:
+                    if not response.headers.get("Content-Range", "").startswith(f"bytes {offset}-"):
+                        raise ValueError("Unexpected attachment range")
+                    mode = "ab"
+                else:
+                    # A mirror may ignore Range. Its response starts at byte zero.
+                    mode = "wb"
+                with tmp.open(mode) as out:
+                    while chunk := response.read(65536):
+                        out.write(chunk)
+            if tmp.stat().st_size >= expected:
+                break
+            raise OSError("Incomplete attachment")
+        except OSError:
+            failures = 0 if tmp.exists() and tmp.stat().st_size > offset else failures + 1
+            if failures >= 3:
+                raise
+            time.sleep(1)
+    if tmp.stat().st_size != expected or hashlib.sha256(tmp.read_bytes()).hexdigest() != attachment["hash"]:
+        tmp.unlink()
+        raise ValueError(f"Invalid translation attachment: {dest.name}")
+    tmp.replace(dest)
+
+
 def fetch_pair(data: list[dict], src: str, dst: str, out_root: Path) -> bool:
     """Download one direction. Returns False if the pair is not published."""
     pair = f"{src}{dst}"
@@ -119,21 +155,10 @@ def fetch_pair(data: list[dict], src: str, dst: str, out_root: Path) -> bool:
     for kind, record in wanted.items():
         dest = target / f"{kind}.{pair}.{suffix[kind]}"
         expected = record["attachment"]["size"]
-        # Resume is not worth the complexity here: a partial file is simply
-        # re-fetched. What matters is never leaving a truncated model in place
-        # that would fail cryptically at translation time.
         if dest.exists() and dest.stat().st_size == expected:
-            continue
-        url = ATTACHMENT_BASE + record["attachment"]["location"]
-        tmp = dest.with_suffix(dest.suffix + ".part")
-        with urllib.request.urlopen(url, timeout=300) as response:
-            tmp.write_bytes(response.read())
-        if tmp.stat().st_size != expected:
-            tmp.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"{pair}/{kind}: expected {expected} bytes, got a short read"
-            )
-        tmp.rename(dest)
+            if hashlib.sha256(dest.read_bytes()).hexdigest() == record["attachment"]["hash"]:
+                continue
+        fetch_attachment(ATTACHMENT_BASE + record["attachment"]["location"], dest, record["attachment"])
 
     if "vocab" in wanted:
         src_vocab = trg_vocab = f"vocab.{pair}.spm"

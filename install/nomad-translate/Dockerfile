@@ -1,21 +1,33 @@
-# Offline translation proxy for the Information Library.
-#
-# amd64 only, and this is not just packaging: Bergamot's intgemm backend is
-# x86 specific and there is no aarch64 wheel. ARM would need marian's `ruy`
-# path. The build workflow pins linux/amd64 so this fails loudly at build time
-# rather than pulling cleanly on ARM and dying at start.
-FROM python:3.10-slim
+# Both builds expose the same Bergamot Python API to the translation proxy.
+FROM python:3.10-slim-bookworm AS wheel-amd64
+RUN pip wheel --no-deps --only-binary=:all: --wheel-dir=/wheels bergamot==0.4.5
 
-# Pinned to python 3.10 because that is what bergamot 0.4.5 publishes wheels
-# for. On 3.12 pip resolves no further than 0.1.2 and the build fails outright.
-# Moving off this pin means moving off the wheel, see below.
-#
-# bergamot 0.4.5 is the PyPI wheel, uploaded 2022-06-21. It works, and it is
-# what the spike proved, but it is old: browsermt/bergamot-translator's last
-# real commit was 2024-05 and the maintained successor is mozilla/translations
-# (inference/). Moving to a build from that repo is tracked as follow-up work
-# and would remove this pin.
-RUN pip install --no-cache-dir bergamot==0.4.5
+FROM python:3.10-slim-bookworm AS wheel-arm64
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git libpcre2-dev libopenblas-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# This revision of Marian uses the ruy kernels on ARM. Target baseline ARMv8-A
+# so wheels built on a CI runner also run on the GB10 and other ARM64 CPUs.
+ARG BERGAMOT_REV=9271618ebbdc5d21ac4dc4df9e72beb7ce644774
+WORKDIR /src
+RUN git init -q && git fetch -q --depth 1 https://github.com/browsermt/bergamot-translator "$BERGAMOT_REV" \
+    && git checkout -q FETCH_HEAD \
+    && git submodule update --init --recursive --depth 1 --jobs 4 -- \
+       3rd_party/marian-dev 3rd_party/pybind11 3rd_party/ssplit-cpp
+ARG BUILD_JOBS=3
+RUN BUILD_ARCH=armv8-a CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" \
+    CMAKE_ARGS="-DGIT_SUBMODULE=OFF -DCOMPILE_CUDA=OFF -DUSE_MKL=OFF -DSSPLIT_USE_INTERNAL_PCRE2=OFF" \
+    pip wheel -v --no-deps --wheel-dir=/wheels .
+
+FROM wheel-${TARGETARCH} AS wheels
+
+FROM python:3.10-slim-bookworm
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = arm64 ]; then \
+      apt-get update && apt-get install -y --no-install-recommends libpcre2-8-0 libopenblas0-pthread libgomp1 && rm -rf /var/lib/apt/lists/*; \
+    fi
+RUN --mount=from=wheels,source=/wheels,target=/wheels \
+    pip install --no-cache-dir /wheels/*.whl && python -c 'from bergamot import Service, ServiceConfig'
 
 WORKDIR /app
 COPY blocks.py proxy.py fetch_models.py entrypoint.sh /app/

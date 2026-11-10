@@ -27,3 +27,11 @@ jobs:
       tag_latest: ${{ inputs.tag_latest }}
     secrets:
       CREATOR_PACKS_APP_KEY: ${{ secrets.CREATOR_PACKS_APP_KEY }}
+
+  translate:
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      image: project-nomad-wsl-translate
+      context: install/nomad-translate
+      version: ${{ inputs.version }}
+      tag_latest: ${{ inputs.tag_latest }}

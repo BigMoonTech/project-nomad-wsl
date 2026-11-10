@@ -11,17 +11,39 @@ RUN apt-get update && apt-get install -y \
       pciutils \
       && rm -rf /var/lib/apt/lists/*
 
+# @openzim/libzim 4.0.0 needs the matching 9.4.0 headers and shared library.
+# Resume interrupted downloads and verify the archive before npm builds the binding.
+FROM base AS libzim
+ARG TARGETARCH
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) arch=x86_64; digest=4a755fcdbfb17f3421b5adf3b5e23c50c7e3f7ae05fa38df71f2d0c44f8feed3 ;; \
+      arm64) arch=aarch64-manylinux; digest=28eaf5a52e6d800c0ca9e215b8ad63e0805a4c98768f9a4134a38ff311b79400 ;; \
+      *) exit 1 ;; \
+    esac; \
+    mkdir /archives; cd /archives; file="libzim_linux-${arch}-9.4.0.tar.gz"; \
+    for attempt in 1 2 3 4 5; do \
+      curl -fSL --connect-timeout 15 --speed-limit 512 --speed-time 30 -C - -o "$file" \
+        "https://download.openzim.org/release/libzim/$file" && break; \
+    done; \
+    echo "$digest  $file" | sha256sum -c -
+
 # All deps stage
 FROM base AS deps
 WORKDIR /app
 ADD admin/package.json admin/package-lock.json ./
-RUN npm ci
+# The package installer skips its network fetch when the archive already exists.
+RUN --mount=type=bind,from=libzim,source=/archives,target=/archives \
+    npm ci --ignore-scripts \
+    && dest=node_modules/@openzim/libzim/download \
+    && mkdir -p "$dest" \
+    && cp /archives/*.tar.gz "$dest/" \
+    && tar -xzf /archives/*.tar.gz --strip-components=1 -C "$dest" \
+    && npm rebuild \
+    && rm "$dest"/*.tar.gz
 
-# Production only deps stage
-FROM base AS production-deps
-WORKDIR /app
-ADD admin/package.json admin/package-lock.json ./
-RUN npm ci --omit=dev
+FROM deps AS production-deps
+RUN npm prune --omit=dev --ignore-scripts
 
 # Build stage
 FROM base AS build
