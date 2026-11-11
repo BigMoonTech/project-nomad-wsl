@@ -491,7 +491,7 @@ export class ContainerRegistryService {
     // Detect release tag prefix convention (e.g. 'v' vs no prefix) if we have a source URL
     let releaseTagPrefix = ''
     if (sourceUrl) {
-      releaseTagPrefix = await this.detectReleaseTagPrefix(sourceUrl, currentTag)
+      releaseTagPrefix = await this.detectReleaseTagPrefix(sourceUrl, parsed.tag)
     }
 
     // Check architecture support for the top candidates (limit checks to save API calls)

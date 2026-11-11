@@ -12,7 +12,16 @@ try {
   const { default: Service } = await import('#models/service')
   const { DockerService } = await import('./app/services/docker_service.js')
   const { RagService } = await import('./app/services/rag_service.js')
+  const { ContainerRegistryService } = await import('./app/services/container_registry_service.js')
   RagService.prototype.discoverNomadDocs = async () => {}
+  // Readiness must probe the replacement itself, not a configured external endpoint.
+  const realFetch = globalThis.fetch
+  let probedUrl
+  try {
+    globalThis.fetch = async (url) => { probedUrl = String(url); return Response.json({ models: [] }) }
+    assert.ok(await new DockerService()._waitForOllamaApi({ inspect: async () => ({ HostConfig: {} }) }))
+    assert.equal(probedUrl, 'http://nomad_ollama:11434/api/tags')
+  } finally { globalThis.fetch = realFetch }
   const official = 'ollama/ollama:0.40.16'
   const managed = 'ghcr.io/bigmoontech/project-nomad-wsl-ollama:1.35.105'
   const name = 'nomad_ollama'
@@ -20,6 +29,28 @@ try {
   const ports = { '11434/tcp': [{ HostIp: '127.0.0.1', HostPort: '12434' }] }
   const env = ['KEEP=retained', 'OLLAMA_CONTEXT_LENGTH=4096', 'MLX_USE_CUDA_GRAPHS=1']
   const config = { Env: env, HostConfig: { Binds: binds, PortBindings: ports, RestartPolicy: { Name: 'unless-stopped' } } }
+  const realUpdates = ContainerRegistryService.prototype.getAvailableUpdates
+  let registryArgs
+  try {
+    ContainerRegistryService.prototype.getAvailableUpdates = async (...args) => {
+      registryArgs = args
+      return [{ tag: '1.35.105', isLatest: true }, { tag: '1.35.104', isLatest: false }]
+    }
+    const docker = new DockerService()
+    docker._detectGPUType = async () => ({ type: 'nvidia' })
+    const service = { service_name: name, container_image: official, source_repo: 'https://github.com/ollama/ollama' }
+    const updates = await docker.getAvailableServiceUpdates(service, 'arm64')
+    assert.equal(registryArgs[0], managed)
+    assert.equal(registryArgs[3], '1.0.0')
+    assert.deepEqual(updates.map((update) => update.tag), ['1.35.105'])
+    assert.match(updates[0].description, /Ollama 0\.40\.16/)
+    await docker.getAvailableServiceUpdates(service, 'amd64')
+    assert.equal(registryArgs[0], official)
+    docker._detectGPUType = async () => ({ type: 'none' })
+    await docker.getAvailableServiceUpdates(service, 'arm64')
+    assert.equal(registryArgs[0], official)
+    console.log('PASS: migration update offers require ARM64 and working NVIDIA access')
+  } finally { ContainerRegistryService.prototype.getAvailableUpdates = realUpdates }
   let passed = 0
 
   for (const scenario of [
@@ -27,6 +58,8 @@ try {
     { label: 'ARM NVIDIA update preserves data and config', arch: 'aarch64', gpu: 'nvidia', expected: managed },
     { label: 'unhealthy ARM runtime rolls back', arch: 'arm64', gpu: 'nvidia', healthy: false, expected: managed },
     { label: 'WSL/amd64 NVIDIA keeps upstream', arch: 'x86_64', gpu: 'nvidia', target: '0.40.17', expected: 'ollama/ollama:0.40.17' },
+    { label: 'amd64 AMD install pulls ROCm', arch: 'x86_64', gpu: 'amd', fresh: true, expected: 'ollama/ollama:rocm', recorded: official },
+    { label: 'amd64 AMD update keeps ROCm devices', arch: 'x86_64', gpu: 'amd', target: '0.40.17', expected: 'ollama/ollama:rocm', recorded: 'ollama/ollama:0.40.17' },
     { label: 'ARM CPU keeps upstream', arch: 'aarch64', gpu: 'none', target: '0.40.17', expected: 'ollama/ollama:0.40.17' },
     { label: 'custom ARM image stays custom', arch: 'aarch64', gpu: 'nvidia', custom: true, image: 'mine/ollama:0.40.16', target: '0.40.17', expected: 'mine/ollama:0.40.17' },
   ]) {
@@ -50,6 +83,8 @@ try {
       createContainer: async (options) => { created = options; return replacement },
     }
     docker._detectGPUType = async () => ({ type: scenario.gpu })
+    docker._discoverAMDDevices = async () => [{ PathOnHost: '/dev/kfd', PathInContainer: '/dev/kfd', CgroupPermissions: 'rwm' }]
+    docker._resolveAmdHsaOverride = async () => null
     docker._broadcast = () => {}
     docker._applyHostStorageRoot = async () => {}
     docker._checkImageExists = async () => false
@@ -74,7 +109,7 @@ try {
       assert.equal(saved.container_image, official)
       assert.equal(saved.source_repo, 'https://github.com/ollama/ollama')
     } else {
-      assert.equal(saved.container_image, scenario.expected)
+      assert.equal(saved.container_image, scenario.recorded || scenario.expected)
       if (!scenario.fresh) assert.ok(oldRemoved)
     }
     if (scenario.expected === managed) {
@@ -83,7 +118,10 @@ try {
       assert.ok(!created.Env.includes('MLX_USE_CUDA_GRAPHS=1'))
     } else {
       assert.equal(healthChecks, 0)
-      assert.deepEqual(created.Env, env)
+      if (scenario.gpu === 'amd') {
+        assert.ok(created.Env.includes('OLLAMA_IGPU_ENABLE=1'))
+        assert.equal(created.HostConfig.Devices[0].PathOnHost, '/dev/kfd')
+      } else assert.deepEqual(created.Env, env)
     }
     console.log(`PASS: ${scenario.label}`)
     passed++
