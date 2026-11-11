@@ -6,6 +6,7 @@ import { Ollama } from 'ollama'
 import { ThinkTagSplitter, normalizeNonStreamed } from '../utils/think_stream.js'
 import { readContextLength, readModelfileNumCtx } from '../utils/context_window.js'
 import { compatSamplerParams, nativeSamplerOptions, readModelfileSamplers } from '../utils/sampler.js'
+import { compareModelsByPopularity, parseModelPulls } from '../utils/model_popularity.js'
 import { NomadOllamaModel, SamplerProfile } from '../../types/ollama.js'
 import { EMBEDDING_MODEL_NAME, FALLBACK_RECOMMENDED_OLLAMA_MODELS } from '../../constants/ollama.js'
 import fs from 'node:fs/promises'
@@ -1349,7 +1350,14 @@ export class OllamaService {
         }
       }
 
-      const sortedByPulls = sort === 'pulls' ? models : this.sortModels(models, 'pulls')
+      // The catalog can omit popularity statistics. Keep the full catalog for
+      // browsing, but use the curated defaults instead of arbitrary recommendations.
+      const recommendedCandidates = models.some(
+        (model) => parseModelPulls(model.estimated_pulls) !== null
+      )
+        ? models
+        : [...FALLBACK_RECOMMENDED_OLLAMA_MODELS]
+      const sortedByPulls = this.sortModels(recommendedCandidates, 'pulls')
       const firstThree = sortedByPulls.slice(0, 3)
 
       const recommendedModels = firstThree.map((model) => {
@@ -1482,19 +1490,7 @@ export class OllamaService {
 
   private sortModels(models: NomadOllamaModel[], sort?: 'pulls' | 'name'): NomadOllamaModel[] {
     if (sort === 'pulls') {
-      models.sort((a, b) => {
-        const parsePulls = (pulls: string) => {
-          const multiplier = pulls.endsWith('K')
-            ? 1_000
-            : pulls.endsWith('M')
-              ? 1_000_000
-              : pulls.endsWith('B')
-                ? 1_000_000_000
-                : 1
-          return parseFloat(pulls) * multiplier
-        }
-        return parsePulls(b.estimated_pulls) - parsePulls(a.estimated_pulls)
-      })
+      models.sort(compareModelsByPopularity)
     } else if (sort === 'name') {
       models.sort((a, b) => a.name.localeCompare(b.name))
     }

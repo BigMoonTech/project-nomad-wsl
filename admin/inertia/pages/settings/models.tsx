@@ -575,10 +575,12 @@ export default function ModelsPage(props: {
               {
                 accessor: 'estimated_pulls',
                 title: 'Estimated Pulls',
+                render: (record) => record.estimated_pulls || 'Unavailable',
               },
               {
                 accessor: 'model_last_updated',
                 title: 'Last Updated',
+                render: (record) => record.model_last_updated || 'Unavailable',
               },
             ]}
             data={availableModelData?.models || []}

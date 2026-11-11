@@ -2,8 +2,8 @@ export type NomadOllamaModel = {
   id: string
   name: string
   description: string
-  estimated_pulls: string
-  model_last_updated: string
+  estimated_pulls: string | null
+  model_last_updated: string | null
   first_seen: string
   tags: NomadOllamaModelTag[]
 }
