@@ -1,7 +1,6 @@
 import { Job } from 'bullmq'
 import { QueueService } from '#services/queue_service'
 import { DockerService } from '#services/docker_service'
-import { ContainerRegistryService } from '#services/container_registry_service'
 import Service from '#models/service'
 import logger from '@adonisjs/core/services/logger'
 import transmit from '@adonisjs/transmit/services/main'
@@ -21,7 +20,6 @@ export class CheckServiceUpdatesJob {
     logger.info('[CheckServiceUpdatesJob] Checking for service updates...')
 
     const dockerService = new DockerService()
-    const registryService = new ContainerRegistryService()
 
     // Determine host architecture
     const hostArch = await this.getHostArch(dockerService)
@@ -31,11 +29,7 @@ export class CheckServiceUpdatesJob {
 
     for (const service of installedServices) {
       try {
-        const updates = await registryService.getAvailableUpdates(
-          service.container_image,
-          hostArch,
-          service.source_repo
-        )
+        const updates = await dockerService.getAvailableServiceUpdates(service, hostArch)
 
         const latestUpdate = updates.length > 0 ? updates[0].tag : null
 

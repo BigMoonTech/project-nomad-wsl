@@ -22,6 +22,7 @@ import env from '#start/env'
 import KVStore from '#models/kv_store'
 import { KV_STORE_SCHEMA, KVStoreKey } from '../../types/kv_store.js'
 import { isNewerVersion } from '../utils/version.js'
+import { isNomadOllamaImage } from '../utils/ollama_runtime.js'
 import { isUnresolvedGpuModel } from '../utils/gpu_model.js'
 import {
   classifyOllamaComputeBackend,
@@ -243,7 +244,7 @@ export class SystemService {
         }
 
         const actualImage = (ollamaContainer.Image || '').toLowerCase()
-        if (actualImage.includes('ollama/ollama') || actualImage.startsWith('ollama:')) {
+        if (actualImage.includes('ollama/ollama') || actualImage.startsWith('ollama:') || isNomadOllamaImage(actualImage)) {
           return null
         }
       }

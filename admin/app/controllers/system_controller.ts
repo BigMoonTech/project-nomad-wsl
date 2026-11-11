@@ -246,11 +246,7 @@ export default class SystemController {
 
         try {
             const hostArch = await this.getHostArch()
-            const updates = await this.containerRegistryService.getAvailableUpdates(
-                service.container_image,
-                hostArch,
-                service.source_repo
-            )
+            const updates = await this.dockerService.getAvailableServiceUpdates(service, hostArch)
             response.send({ versions: updates })
         } catch (error) {
             logger.error({ err: error }, `[SystemController] Failed to fetch versions for ${serviceName}`)

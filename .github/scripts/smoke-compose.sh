@@ -64,6 +64,7 @@ await queue.add('run-download', {
 await queue.close()
 NODE
 boot
+"${compose[@]}" exec -T admin node --input-type=module < .github/scripts/test-ollama-lifecycle.mjs
 "${compose[@]}" exec -T admin sh -ec '
   for i in $(seq 1 45); do
     if test -f /app/storage/worker-smoke.png; then

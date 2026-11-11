@@ -15,6 +15,9 @@ on:
       tag_latest:
         type: boolean
         required: true
+      cache:
+        type: boolean
+        default: false
     secrets:
       CREATOR_PACKS_APP_KEY:
         required: false
@@ -47,6 +50,8 @@ jobs:
         with:
           context: ${{ inputs.context }}
           platforms: linux/${{ matrix.arch }}
+          cache-from: ${{ inputs.cache && matrix.arch == 'arm64' && format('type=registry,ref={0}:buildcache-arm64', env.IMAGE) || '' }}
+          cache-to: ${{ inputs.cache && matrix.arch == 'arm64' && github.ref == 'refs/heads/main' && format('type=registry,ref={0}:buildcache-arm64,mode=max', env.IMAGE) || '' }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             VERSION=${{ inputs.version }}

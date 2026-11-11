@@ -27,6 +27,12 @@ import KVStore from '#models/kv_store'
 import { BROADCAST_CHANNELS } from '../../constants/broadcast.js'
 import { KIWIX_LIBRARY_CMD } from '../../constants/kiwix.js'
 import { DEFAULT_OLLAMA_CONTEXT_LENGTH } from '../../constants/ollama.js'
+import { ContainerRegistryService } from './container_registry_service.js'
+import {
+  canMigrateOllamaRuntime, isNomadOllamaImage, isNomadOllamaRelease,
+  NOMAD_OLLAMA_REPOSITORY, NOMAD_OLLAMA_SOURCE, NOMAD_OLLAMA_ENGINE,
+  nomadOllamaRelease, ollamaRuntimeEnv, selectOllamaRuntimeImage,
+} from '../utils/ollama_runtime.js'
 
 // Written by install_nomad.sh with the host AMD GPU's gfx target.
 const AMD_GFX_MARKER_PATH = '/app/storage/.nomad-amd-gfx'
@@ -84,6 +90,54 @@ export class DockerService {
         else resolve()
       })
     })
+  }
+
+  /** Use the same runtime offer in the manual update picker and scheduled checks. */
+  async getAvailableServiceUpdates(service: Service, hostArch: string) {
+    const registry = new ContainerRegistryService()
+    if (
+      service.service_name === SERVICE_NAMES.OLLAMA && !service.is_custom && !service.is_user_modified &&
+      canMigrateOllamaRuntime(service.container_image, hostArch, 'nvidia') &&
+      (await this._detectGPUType()).type === 'nvidia'
+    ) {
+      const { SystemService } = await import('./system_service.js')
+      const image = `${NOMAD_OLLAMA_REPOSITORY}:${nomadOllamaRelease(SystemService.getAppVersion())}`
+      const updates = await registry.getAvailableUpdates(image, hostArch, NOMAD_OLLAMA_SOURCE, '1.0.0')
+      return updates.filter((update) => isNomadOllamaRelease(update.tag)).map((update) => ({
+        ...update,
+        description: `ARM64 NVIDIA runtime with MLX support (Ollama ${NOMAD_OLLAMA_ENGINE})`,
+      }))
+    }
+    return registry.getAvailableUpdates(service.container_image, hostArch, service.source_repo)
+  }
+
+  private async _selectOllamaRuntime(service: Service, gpu: string, targetVersion?: string) {
+    const arch = await this.docker.info().then((info) => info.Architecture || '').catch(() => '')
+    const { SystemService } = await import('./system_service.js')
+    const image = selectOllamaRuntimeImage(
+      service.container_image, arch,
+      service.is_custom || service.is_user_modified ? 'none' : gpu,
+      SystemService.getAppVersion(), targetVersion
+    )
+    return { image, arch }
+  }
+
+  private async _waitForOllamaApi(container: Docker.Container): Promise<boolean> {
+    // Probe this local container, even when an external Ollama URL is configured.
+    const inspect = await container.inspect().catch(() => null)
+    if (!inspect) return false
+    const hostPort = inspect.HostConfig.PortBindings?.['11434/tcp']?.[0]?.HostPort || '11434'
+    const url = process.env.NODE_ENV === 'production'
+      ? `http://${SERVICE_NAMES.OLLAMA}:11434`
+      : `http://127.0.0.1:${hostPort}`
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        const response = await fetch(new URL('/api/tags', url), { signal: AbortSignal.timeout(2000) })
+        if (response.ok && Array.isArray((await response.json() as { models?: unknown }).models)) return true
+      } catch { /* The new server may still be starting. */ }
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+    return false
   }
 
   async affectContainer(
@@ -671,14 +725,15 @@ export class DockerService {
         }
       }
 
-      const imageExists = await this._checkImageExists(service.container_image)
-      if (imageExists) {
+      // Ollama selects its GPU/runtime variant below before pulling the image.
+      const imageExists = service.service_name === SERVICE_NAMES.OLLAMA || await this._checkImageExists(service.container_image)
+      if (imageExists && service.service_name !== SERVICE_NAMES.OLLAMA) {
         this._broadcast(
           service.service_name,
           'image-exists',
           `Docker image ${service.container_image} already exists locally. Skipping pull...`
         )
-      } else {
+      } else if (!imageExists) {
         // Start pulling the Docker image and wait for it to complete
         this._broadcast(
           service.service_name,
@@ -735,11 +790,15 @@ export class DockerService {
 
       // GPU-aware configuration for Ollama
       let finalImage = service.container_image
+      let runtimeArch = ''
       let gpuHostConfig = containerConfig?.HostConfig || {}
       let amdGpuConfigured = false
 
       if (service.service_name === SERVICE_NAMES.OLLAMA) {
         const gpuResult = await this._detectGPUType()
+        const selected = await this._selectOllamaRuntime(service, gpuResult.type)
+        finalImage = selected.image
+        runtimeArch = selected.arch
 
         if (gpuResult.type === 'nvidia') {
           this._broadcast(
@@ -773,19 +832,6 @@ export class DockerService {
             )
 
             finalImage = 'ollama/ollama:rocm'
-
-            // The pull-if-missing earlier in this function used service.container_image
-            // (the DB-pinned tag, e.g. ollama/ollama:0.18.2). The AMD branch overrides
-            // to a different tag — so we need to pull :rocm separately if it's not local.
-            const rocmImageExists = await this._checkImageExists(finalImage)
-            if (!rocmImageExists) {
-              this._broadcast(
-                service.service_name,
-                'pulling',
-                `Pulling Docker image ${finalImage}...`
-              )
-              await this.pullImage(finalImage)
-            }
 
             const amdDevices = await this._discoverAMDDevices()
             gpuHostConfig = {
@@ -890,12 +936,16 @@ export class DockerService {
         }),
       })
 
+      if (service.service_name === SERVICE_NAMES.OLLAMA && !(await this._checkImageExists(finalImage))) {
+        this._broadcast(service.service_name, 'pulling', `Pulling Docker image ${finalImage}...`)
+        await this.pullImage(finalImage)
+      }
       let container = await this.docker.createContainer(
-        buildCreateOptions(finalImage, gpuHostConfig, [
+        buildCreateOptions(finalImage, gpuHostConfig, ollamaRuntimeEnv(finalImage, runtimeArch, [
           ...(containerConfig?.Env ?? []),
           ...ollamaEnv,
           ...appEnv,
-        ])
+        ]))
       )
 
       this._broadcast(
@@ -948,9 +998,13 @@ export class DockerService {
           (e) => !e.startsWith('HSA_OVERRIDE_GFX_VERSION=') && !e.startsWith('OLLAMA_IGPU_ENABLE=')
         )
         amdGpuConfigured = false
-        // service.container_image is the CPU tag, already pulled earlier in this
-        // function before the AMD branch overrode finalImage to :rocm.
+        // The first pull selected ROCm. Its CPU fallback is a separate image and
+        // may not exist locally on a fresh install.
         finalImage = service.container_image
+        if (!(await this._checkImageExists(finalImage))) {
+          this._broadcast(service.service_name, 'pulling', `Pulling Docker image ${finalImage}...`)
+          await this.pullImage(finalImage)
+        }
         container = await this.docker.createContainer(
           buildCreateOptions(finalImage, cpuHostConfig, [
             ...(containerConfig?.Env ?? []),
@@ -968,6 +1022,11 @@ export class DockerService {
       )
       service.installed = true
       service.installation_status = 'idle'
+      if (isNomadOllamaImage(finalImage)) {
+        if (!(await this._waitForOllamaApi(container))) throw new Error('Ollama API did not become ready')
+        service.container_image = finalImage
+        service.source_repo = NOMAD_OLLAMA_SOURCE
+      }
       await service.save()
       this.invalidateServicesStatusCache()
 
@@ -1796,8 +1855,9 @@ export class DockerService {
       const imageBase = currentImage.includes(':')
         ? currentImage.substring(0, currentImage.lastIndexOf(':'))
         : currentImage
-      const newImage = `${imageBase}:${targetVersion}`
+      let newImage = `${imageBase}:${targetVersion}`
       let runtimeImage = newImage
+      let runtimeArch = ''
 
       // GPU detection runs before the pull so AMD updates pull ollama/ollama:rocm rather
       // than the standard tag. Detection result is reused below when building the new
@@ -1807,6 +1867,10 @@ export class DockerService {
       let updatedAmdGpuConfigured = false
       if (serviceName === SERVICE_NAMES.OLLAMA) {
         const gpuResult = await this._detectGPUType()
+        const selected = await this._selectOllamaRuntime(service, gpuResult.type, targetVersion)
+        newImage = selected.image
+        runtimeImage = newImage
+        runtimeArch = selected.arch
         if (gpuResult.type === 'nvidia') {
           this._broadcast(
             serviceName,
@@ -1924,6 +1988,7 @@ export class DockerService {
         // issue #1056 fix (which wouldn't have it in the captured env) pick it up.
         finalEnv.push('OLLAMA_IGPU_ENABLE=1')
       }
+      finalEnv = ollamaRuntimeEnv(runtimeImage, runtimeArch, finalEnv)
 
       // Heal a Homebox container that predates the #1043 fix: inject the persisted pepper on
       // update if it's missing, so an update (not just a force-reinstall) fixes the crash loop.
@@ -2003,9 +2068,11 @@ export class DockerService {
 
       // Step 6: Health check — verify container stays running for 5 seconds
       await new Promise((resolve) => setTimeout(resolve, 5000))
-      const newContainerInfo = await newContainer.inspect()
+      const newContainerInfo = await newContainer.inspect().catch(() => null)
 
-      if (newContainerInfo.State?.Running) {
+      const apiReady = newContainerInfo?.State?.Running &&
+        (!isNomadOllamaImage(runtimeImage) || await this._waitForOllamaApi(newContainer))
+      if (apiReady) {
         // Healthy — clean up old container
         try {
           const oldContainerRef = this.docker.getContainer(
@@ -2020,6 +2087,7 @@ export class DockerService {
 
         // Update DB
         service.container_image = newImage
+        if (isNomadOllamaImage(newImage)) service.source_repo = NOMAD_OLLAMA_SOURCE
         service.available_update_version = null
         await service.save()
 
@@ -2050,7 +2118,7 @@ export class DockerService {
         this.activeInstallations.delete(serviceName)
         return {
           success: false,
-          message: `Update failed: new container did not stay running. Rolled back to previous version.`,
+          message: `Update failed: new container failed its readiness check. Rolled back to previous version.`,
         }
       }
     } catch (error: any) {
