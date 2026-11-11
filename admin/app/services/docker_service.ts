@@ -998,9 +998,13 @@ export class DockerService {
           (e) => !e.startsWith('HSA_OVERRIDE_GFX_VERSION=') && !e.startsWith('OLLAMA_IGPU_ENABLE=')
         )
         amdGpuConfigured = false
-        // service.container_image is the CPU tag, already pulled earlier in this
-        // function before the AMD branch overrode finalImage to :rocm.
+        // The first pull selected ROCm. Its CPU fallback is a separate image and
+        // may not exist locally on a fresh install.
         finalImage = service.container_image
+        if (!(await this._checkImageExists(finalImage))) {
+          this._broadcast(service.service_name, 'pulling', `Pulling Docker image ${finalImage}...`)
+          await this.pullImage(finalImage)
+        }
         container = await this.docker.createContainer(
           buildCreateOptions(finalImage, cpuHostConfig, [
             ...(containerConfig?.Env ?? []),

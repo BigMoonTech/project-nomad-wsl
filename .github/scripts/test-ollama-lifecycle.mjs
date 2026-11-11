@@ -59,6 +59,7 @@ try {
     { label: 'unhealthy ARM runtime rolls back', arch: 'arm64', gpu: 'nvidia', healthy: false, expected: managed },
     { label: 'WSL/amd64 NVIDIA keeps upstream', arch: 'x86_64', gpu: 'nvidia', target: '0.40.17', expected: 'ollama/ollama:0.40.17' },
     { label: 'amd64 AMD install pulls ROCm', arch: 'x86_64', gpu: 'amd', fresh: true, expected: 'ollama/ollama:rocm', recorded: official },
+    { label: 'AMD missing ROCm device pulls the CPU fallback', arch: 'x86_64', gpu: 'amd', fresh: true, missingDevice: true, expected: official },
     { label: 'amd64 AMD update keeps ROCm devices', arch: 'x86_64', gpu: 'amd', target: '0.40.17', expected: 'ollama/ollama:rocm', recorded: 'ollama/ollama:0.40.17' },
     { label: 'ARM CPU keeps upstream', arch: 'aarch64', gpu: 'none', target: '0.40.17', expected: 'ollama/ollama:0.40.17' },
     { label: 'custom ARM image stays custom', arch: 'aarch64', gpu: 'nvidia', custom: true, image: 'mine/ollama:0.40.16', target: '0.40.17', expected: 'mine/ollama:0.40.17' },
@@ -67,20 +68,26 @@ try {
     service.merge({ container_image: scenario.image || official, installed: !scenario.fresh, installation_status: 'idle',
       source_repo: 'https://github.com/ollama/ollama', is_custom: !!scenario.custom, is_user_modified: false, depends_on: null })
     await service.save()
-    let oldName = name, oldRunning = true, oldRemoved = false, newRemoved = false, created, pulled, healthChecks = 0
+    let oldName = name, oldRunning = true, oldRemoved = false, newRemoved = false, created, pulled, healthChecks = 0, creations = 0
+    const pulledImages = []
     const old = {
       inspect: async () => ({ Config: { Env: env, Cmd: ['serve'] }, HostConfig: config.HostConfig, NetworkSettings: { Networks: { nomad_test: {} } } }),
       stop: async () => { oldRunning = false }, start: async () => { oldRunning = true },
       rename: async ({ name: next }) => { oldName = next }, remove: async () => { oldRemoved = true },
     }
-    const replacement = { start: async () => {}, stop: async () => {}, remove: async () => { newRemoved = true },
+    const replacement = { start: async () => {
+      if (scenario.missingDevice && creations === 1) throw new Error('error gathering device information while adding custom device /dev/kfd: no such file or directory')
+    }, stop: async () => {}, remove: async () => { newRemoved = true },
       inspect: async () => ({ State: { Running: true } }) }
     const docker = new DockerService()
     docker.docker = {
       info: async () => ({ Architecture: scenario.arch }),
       listContainers: async () => oldRemoved ? [] : [{ Id: 'old', Names: [`/${oldName}`], State: oldRunning ? 'running' : 'exited' }],
       getContainer: () => old,
-      createContainer: async (options) => { created = options; return replacement },
+      createContainer: async (options) => {
+        assert.ok(pulledImages.includes(options.Image), `Image not pulled: ${options.Image}`)
+        creations++; created = options; return replacement
+      },
     }
     docker._detectGPUType = async () => ({ type: scenario.gpu })
     docker._discoverAMDDevices = async () => [{ PathOnHost: '/dev/kfd', PathInContainer: '/dev/kfd', CgroupPermissions: 'rwm' }]
@@ -88,7 +95,7 @@ try {
     docker._broadcast = () => {}
     docker._applyHostStorageRoot = async () => {}
     docker._checkImageExists = async () => false
-    docker.pullImage = async (image) => { pulled = image }
+    docker.pullImage = async (image) => { pulled = image; pulledImages.push(image) }
     docker._waitForOllamaApi = async () => { healthChecks++; return scenario.healthy !== false }
     if (scenario.fresh) await docker._createContainer(service, structuredClone(config))
     else {
@@ -97,6 +104,11 @@ try {
     }
     assert.equal(pulled, scenario.expected)
     assert.equal(created.Image, scenario.expected)
+    if (scenario.missingDevice) {
+      assert.deepEqual(pulledImages, ['ollama/ollama:rocm', official])
+      assert.equal(creations, 2)
+      assert.ok(newRemoved, 'The rejected ROCm container must be removed')
+    }
     assert.deepEqual(created.HostConfig.Binds, binds)
     assert.deepEqual(created.HostConfig.PortBindings, ports)
     assert.ok(created.Env.includes('KEEP=retained'))
@@ -118,7 +130,10 @@ try {
       assert.ok(!created.Env.includes('MLX_USE_CUDA_GRAPHS=1'))
     } else {
       assert.equal(healthChecks, 0)
-      if (scenario.gpu === 'amd') {
+      if (scenario.missingDevice) {
+        assert.ok(!created.Env.some((value) => /^(OLLAMA_IGPU_ENABLE|HSA_OVERRIDE_GFX_VERSION)=/.test(value)))
+        assert.equal(created.HostConfig.Devices, undefined)
+      } else if (scenario.gpu === 'amd') {
         assert.ok(created.Env.includes('OLLAMA_IGPU_ENABLE=1'))
         assert.equal(created.HostConfig.Devices[0].PathOnHost, '/dev/kfd')
       } else assert.deepEqual(created.Env, env)
