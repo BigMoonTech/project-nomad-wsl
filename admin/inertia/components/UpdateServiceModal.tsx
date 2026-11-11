@@ -24,7 +24,7 @@ export default function UpdateServiceModal({
 }: UpdateServiceModalProps) {
     const [selectedVersion, setSelectedVersion] = useState(latestVersion)
     const [showAdvanced, setShowAdvanced] = useState(false)
-    const [versions, setVersions] = useState<Array<{ tag: string; isLatest: boolean; releaseUrl?: string }>>([])
+    const [versions, setVersions] = useState<Array<{ tag: string; isLatest: boolean; releaseUrl?: string; description?: string }>>([])
     const [loadingVersions, setLoadingVersions] = useState(false)
 
     async function loadVersions() {
@@ -112,7 +112,10 @@ export default function UpdateServiceModal({
                                                 onChange={() => setSelectedVersion(v.tag)}
                                                 className="text-desert-green focus:ring-desert-green"
                                             />
-                                            <span className="text-sm font-medium text-text-primary">{v.tag}</span>
+                                            <span className="text-sm font-medium text-text-primary">
+                                                {v.tag}
+                                                {v.description && <span className="block text-xs font-normal text-text-muted">{v.description}</span>}
+                                            </span>
                                             {v.isLatest && (
                                                 <span className="text-xs bg-desert-green/10 text-desert-green px-2 py-0.5 rounded-full">
                                                     Latest

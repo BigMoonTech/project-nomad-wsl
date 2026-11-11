@@ -15,6 +15,7 @@ This is the operations guide for maintaining the fork: how it's wired together, 
 Each release image uses one tag for native `linux/amd64` and `linux/arm64` builds. The images are published under `ghcr.io/bigmoontech/`:
 - `ghcr.io/bigmoontech/project-nomad-wsl` — the main admin/Command Center image
 - `ghcr.io/bigmoontech/project-nomad-wsl-translate` — optional offline translation service, built by the primary workflow
+- `ghcr.io/bigmoontech/project-nomad-wsl-ollama` — ARM64 NVIDIA runtime with MLX/CUDA; the amd64 payload is upstream Ollama. Built by the primary workflow. Tags follow the NOMAD release; see [runtime selection and engine version](../install/nomad-ollama/README.md).
 - `ghcr.io/bigmoontech/project-nomad-wsl-sidecar-updater` — the updater sidecar (handles in-app updates)
 - `ghcr.io/bigmoontech/project-nomad-wsl-disk-collector` — the disk info collector sidecar
 
@@ -135,7 +136,7 @@ Merge the tested changes into the fork’s `main`. Both platforms ship from that
 - Look at the previous release tag on https://github.com/BigMoonTech/project-nomad-wsl/releases
 - Apply the fork numbering rule in Part 2. Upstream 1.35.1 maps to fork 1.35.100.
 
-### Step 3: Build all three Docker images
+### Step 3: Run the three image workflows
 **Go to:** https://github.com/BigMoonTech/project-nomad-wsl/actions
 
 For each of these (in any order — they run in parallel):
@@ -151,7 +152,7 @@ For each:
 - **Tag latest:** ✅ check this (unless it's a pre-release/RC)
 - Click **Run workflow**
 
-Wait for all publish jobs in the three workflows, including Translate in the primary workflow. Both platform builds must succeed for that image’s tags to move.
+Wait for all publish jobs in the three workflows, including Translate and Ollama in the primary workflow (five images total). Both platform builds must succeed for that image’s tags to move. Ollama's first ARM64 CUDA build is substantially longer; later builds reuse its Actions cache.
 
 ### Step 4: Verify images published
 
@@ -160,7 +161,7 @@ Check that all three runs succeeded on the same commit. For a stable release, ve
 ```bash
 set -e
 version=1.35.100
-for suffix in '' -sidecar-updater -disk-collector -translate; do
+for suffix in '' -sidecar-updater -disk-collector -translate -ollama; do
   image="ghcr.io/bigmoontech/project-nomad-wsl${suffix}"
   digest=$(docker buildx imagetools inspect "$image:$version" --format '{{.Manifest.Digest}}')
   for alias in "v$version" latest; do
@@ -171,7 +172,7 @@ for suffix in '' -sidecar-updater -disk-collector -translate; do
 done
 ```
 
-On the first publication of the Translate package, set its visibility to **Public** in the GitHub package settings. Check all four image tags from a signed-out Docker client before publishing the GitHub Release.
+On the first publication of each new package, set its visibility to **Public** in the GitHub package settings. Check all five images with full pulls on both architectures from a signed-out Docker client before publishing the GitHub Release.
 
 For a prerelease, leave `tag_latest` off and verify only the versioned aliases.
 

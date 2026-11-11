@@ -24,7 +24,9 @@ jobs:
           docker run --rm --network none --memory=512m --entrypoint node nomad-admin:ci --test \
             tests/unit/regional_map_lfs.spec.js \
             tests/unit/map_assets_archive.spec.js \
-            tests/unit/model_popularity.spec.js
+            tests/unit/model_popularity.spec.js \
+            tests/unit/ollama_runtime.spec.js \
+            tests/unit/ollama_compute.spec.js
           docker run --rm --entrypoint pmtiles nomad-admin:ci version
           docker build -t nomad-updater:ci install/sidecar-updater
           docker run --rm --entrypoint docker nomad-updater:ci compose version
@@ -44,3 +46,26 @@ jobs:
           import proxy
           result = proxy.translate_blocks("enes", ["Hello, how are you?", "This is a <b>house</b>."])
           assert "hola" in result[0].lower() and "<b>" in result[1] and "casa" in result[1], result'
+
+  ollama:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: install/nomad-ollama
+          load: true
+          tags: nomad-ollama:ci
+          cache-from: type=gha,scope=project-nomad-wsl-ollama-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=project-nomad-wsl-ollama-${{ matrix.arch }}
+      - name: Verify engine, preserved GGUF libraries and CPU startup
+        run: bash .github/scripts/test-ollama-image.sh nomad-ollama:ci

@@ -14,6 +14,7 @@ export interface AvailableUpdate {
   tag: string
   isLatest: boolean
   releaseUrl?: string
+  description?: string
 }
 
 interface TokenCacheEntry {
@@ -461,10 +462,11 @@ export class ContainerRegistryService {
   async getAvailableUpdates(
     containerImage: string,
     hostArch: string,
-    fallbackSourceRepo?: string | null
+    fallbackSourceRepo?: string | null,
+    comparisonTag?: string
   ): Promise<AvailableUpdate[]> {
     const parsed = this.parseImageReference(containerImage)
-    const currentTag = parsed.tag
+    const currentTag = comparisonTag ?? parsed.tag
 
     if (currentTag === 'latest') {
       logger.warn(

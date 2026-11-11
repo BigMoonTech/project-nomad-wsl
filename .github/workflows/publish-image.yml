@@ -15,6 +15,9 @@ on:
       tag_latest:
         type: boolean
         required: true
+      cache:
+        type: boolean
+        default: false
     secrets:
       CREATOR_PACKS_APP_KEY:
         required: false
@@ -47,6 +50,8 @@ jobs:
         with:
           context: ${{ inputs.context }}
           platforms: linux/${{ matrix.arch }}
+          cache-from: ${{ inputs.cache && format('type=gha,scope={0}-{1}', inputs.image, matrix.arch) || '' }}
+          cache-to: ${{ inputs.cache && format('type=gha,mode=max,scope={0}-{1}', inputs.image, matrix.arch) || '' }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             VERSION=${{ inputs.version }}

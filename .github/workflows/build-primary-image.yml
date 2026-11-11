@@ -35,3 +35,12 @@ jobs:
       context: install/nomad-translate
       version: ${{ inputs.version }}
       tag_latest: ${{ inputs.tag_latest }}
+
+  ollama:
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      image: project-nomad-wsl-ollama
+      context: install/nomad-ollama
+      version: ${{ inputs.version }}
+      tag_latest: ${{ inputs.tag_latest }}
+      cache: true
