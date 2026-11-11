@@ -65,7 +65,9 @@ jobs:
           context: install/nomad-ollama
           load: true
           tags: nomad-ollama:ci
-          cache-from: type=gha,scope=project-nomad-wsl-ollama-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=project-nomad-wsl-ollama-${{ matrix.arch }}
+          # Read only the public cache produced by a trusted main-branch release.
+          # The full CUDA build exceeds the Actions cache budget; PRs never write
+          # to the release cache or need package-publishing credentials.
+          cache-from: ${{ matrix.arch == 'arm64' && 'type=registry,ref=ghcr.io/bigmoontech/project-nomad-wsl-ollama:buildcache-arm64' || '' }}
       - name: Verify engine, preserved GGUF libraries and CPU startup
         run: bash .github/scripts/test-ollama-image.sh nomad-ollama:ci

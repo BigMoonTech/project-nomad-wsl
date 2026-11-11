@@ -18,6 +18,6 @@ ARM64 uses `MLX_USE_CUDA_GRAPHS=0`. A graph-enabled cold-load test on GB10 produ
 
 PR CI builds both architectures natively, checks every original runtime file against the pinned upstream image, and boots the API without a GPU. Command Center tests cover runtime selection, configuration retention, failed-update rollback and the previous WSL release's database upgrade. GPU release validation additionally runs both `qwen3.8:27b-nvfp4` and `qwen3.8:27b-dflash2-nvfp4` with repeated cold loads, plus GGUF generation and embeddings. A live Windows host is not available for hardware testing.
 
-CUDA targets match the upstream build, including GB10's compute capability 12.1. Compiling these targets takes longer than ordinary NOMAD builds; subsequent builds reuse the dedicated Actions cache. The first model load can also take longer while CUDA compiles kernels.
+CUDA targets match the upstream build, including GB10's compute capability 12.1. Compiling these targets takes longer than ordinary NOMAD builds. The primary workflow saves a registry build cache on `main`; subsequent builds can reuse it. PRs only read this public cache and cannot overwrite it. The full CUDA build exceeds GitHub Actions' default cache budget, so it is not stored there. The first model load can also take longer while CUDA compiles kernels.
 
 All build dependencies are installed inside the Docker build stage. The host and other projects' Node, npm, Python and CUDA environments are untouched.

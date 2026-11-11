@@ -152,7 +152,7 @@ For each:
 - **Tag latest:** ✅ check this (unless it's a pre-release/RC)
 - Click **Run workflow**
 
-Wait for all publish jobs in the three workflows, including Translate and Ollama in the primary workflow (five images total). Both platform builds must succeed for that image’s tags to move. Ollama's first ARM64 CUDA build is substantially longer; later builds reuse its Actions cache. The primary workflow publishes and checks public access to both runtimes before building Command Center, so new installs cannot select an unpublished runtime. If the public-access check fails for a newly created package, make that package public and rerun the failed job.
+Wait for all publish jobs in the three workflows, including Translate and Ollama in the primary workflow (five images total). Both platform builds must succeed for that image’s tags to move. Ollama's first ARM64 CUDA build is substantially longer; later builds can reuse its `buildcache-arm64` registry tag. Only releases from `main` write that cache; PRs only read it. Do not move the CUDA cache to GitHub Actions caching: it exceeds the default budget and layers are evicted before the cache can be restored. The primary workflow publishes and checks public access to both runtimes before building Command Center, so new installs cannot select an unpublished runtime. If the public-access check fails for a newly created package, make that package public and rerun the failed job.
 
 ### Step 4: Verify images published
 
