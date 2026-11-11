@@ -19,6 +19,7 @@ permissions:
 
 jobs:
   build:
+    needs: verify-runtime-public
     uses: ./.github/workflows/publish-image.yml
     with:
       image: project-nomad-wsl
@@ -44,3 +45,19 @@ jobs:
       version: ${{ inputs.version }}
       tag_latest: ${{ inputs.tag_latest }}
       cache: true
+
+  verify-runtime-public:
+    needs: [ollama, translate]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      # A new Command Center release selects matching runtime tags on fresh
+      # installs. Verify those dependencies anonymously before moving its tags.
+      - name: Verify runtime images are public on both architectures
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          for component in ollama translate; do
+            docker buildx imagetools inspect "ghcr.io/bigmoontech/project-nomad-wsl-$component:$VERSION" --raw | jq -e '
+              [.manifests[].platform | select(.os == "linux") | .architecture] | unique == ["amd64", "arm64"]'
+          done
