@@ -24,6 +24,8 @@ jobs:
           docker run --rm --network none --memory=512m --entrypoint node nomad-admin:ci --test \
             tests/unit/regional_map_lfs.spec.js \
             tests/unit/map_assets_archive.spec.js \
+            tests/unit/http_dependencies.spec.js \
+            tests/unit/compression_middleware.spec.js \
             tests/unit/model_popularity.spec.js \
             tests/unit/ollama_runtime.spec.js \
             tests/unit/ollama_compute.spec.js
