@@ -104,6 +104,7 @@ async function withDownload(run: (file: string) => Promise<void>) {
 }
 
 const bytes = Buffer.from('NOMAD download fixture with exact resumed bytes')
+const downloadOptions = { timeout: 2000, allowedMimeTypes: ['application/octet-stream'] }
 function fileHeaders(res: Parameters<RequestListener>[1]) {
   res.setHeader('Content-Type', 'application/octet-stream')
   res.setHeader('Content-Length', bytes.length)
@@ -139,6 +140,7 @@ test('real same-origin redirects preserve credentials and resume downloads byte-
         let completed = ''
         await doResumableDownload(
           {
+            ...downloadOptions,
             url: url + '/redirect',
             filepath,
             requestHeaders: { Authorization: 'Bearer fixture' },
@@ -176,6 +178,7 @@ test('cross-host redirects strip credentials while allowing ordinary downloads',
           withDownload(async (filepath) => {
             await doResumableDownload(
               {
+                ...downloadOptions,
                 url,
                 filepath,
                 requestHeaders: { Authorization: 'Bearer fixture', Cookie: 'test=private' },
@@ -201,7 +204,7 @@ test('a mirror ignoring Range restarts cleanly instead of appending duplicate by
     async (url) =>
       withDownload(async (filepath) => {
         await writeFile(filepath + '.tmp', bytes.subarray(0, 7))
-        await doResumableDownload({ url, filepath }, axios.create({ proxy: false }))
+        await doResumableDownload({ ...downloadOptions, url, filepath }, axios.create({ proxy: false }))
         assert.deepEqual(await readFile(filepath), bytes)
       }),
   )
@@ -217,7 +220,7 @@ test('gated-content failures retain their existing error contract', async () => 
     async (url) =>
       withDownload(async (filepath) => {
         await assert.rejects(
-          doResumableDownload({ url, filepath }, axios.create({ proxy: false })),
+          doResumableDownload({ ...downloadOptions, url, filepath }, axios.create({ proxy: false })),
           GatedContentAuthError,
         )
         await assert.rejects(stat(filepath), { code: 'ENOENT' })
@@ -239,7 +242,7 @@ test(
         withDownload(async (filepath) => {
           const controller = new AbortController()
           const download = doResumableDownload(
-            { url, filepath, signal: controller.signal },
+            { ...downloadOptions, url, filepath, signal: controller.signal },
             axios.create({ proxy: false }),
           )
           const rejected = assert.rejects(download, /abort|cancel/i)
